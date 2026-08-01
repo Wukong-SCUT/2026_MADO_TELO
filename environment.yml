@@ -1,0 +1,20 @@
+﻿name: meta_
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - tqdm
+  - gym=0.26.2
+  - h5py
+  - openpyxl
+  - cloudpickle
+  - pytorch
+  - tensorboard
+  - pip:
+      - opencv-python

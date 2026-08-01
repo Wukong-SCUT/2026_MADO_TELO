@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+env/agent/save_dir/
+outputs/*
+!outputs/README.md

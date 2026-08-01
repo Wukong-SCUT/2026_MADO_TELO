@@ -1,0 +1,14 @@
+# Runtime dependencies for the C8c CDOBench/WSN release.
+numpy
+scipy
+pandas
+matplotlib
+tqdm
+gym==0.26.2
+h5py
+openpyxl
+cloudpickle
+torch
+tensorboard
+opencv-python
+
