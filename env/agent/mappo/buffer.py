@@ -14,12 +14,18 @@ class MAPPOBuffer:
         self.log_probs_cfg = []
         self.log_probs_res = []
         self.log_probs_comm = []
+        self.log_probs_collab = []
+        self.log_probs_guide_scale = []
+        self.log_probs_actuator = []
         self.rewards = []
         self.dones = []
         self.values_opt = []
         self.values_cfg = []
         self.values_res = []
         self.values_comm = []
+        self.values_collab = []
+        self.values_guide_scale = []
+        self.values_actuator = []
         self.values_ref = []
 
         self.returns = None
@@ -27,6 +33,9 @@ class MAPPOBuffer:
         self.adv_cfg = None
         self.adv_res = None
         self.adv_comm = None
+        self.adv_collab = None
+        self.adv_guide_scale = None
+        self.adv_actuator = None
 
     def add(
         self,
@@ -41,10 +50,16 @@ class MAPPOBuffer:
         values_res,
         values_ref,
         values_comm=None,
+        values_collab=None,
+        values_guide_scale=None,
+        values_actuator=None,
         log_probs_opt=None,
         log_probs_cfg=None,
         log_probs_res=None,
         log_probs_comm=None,
+        log_probs_collab=None,
+        log_probs_guide_scale=None,
+        log_probs_actuator=None,
     ):
         self.obs.append(obs.detach())
         self.global_obs.append(global_obs.detach())
@@ -59,19 +74,37 @@ class MAPPOBuffer:
             log_probs_res = torch.zeros_like(log_probs)
         if log_probs_comm is None:
             log_probs_comm = torch.zeros_like(log_probs)
+        if log_probs_collab is None:
+            log_probs_collab = torch.zeros_like(log_probs)
+        if log_probs_guide_scale is None:
+            log_probs_guide_scale = torch.zeros_like(log_probs)
+        if log_probs_actuator is None:
+            log_probs_actuator = torch.zeros_like(log_probs)
         self.log_probs_opt.append(log_probs_opt.detach())
         self.log_probs_cfg.append(log_probs_cfg.detach())
         self.log_probs_res.append(log_probs_res.detach())
         self.log_probs_comm.append(log_probs_comm.detach())
+        self.log_probs_collab.append(log_probs_collab.detach())
+        self.log_probs_guide_scale.append(log_probs_guide_scale.detach())
+        self.log_probs_actuator.append(log_probs_actuator.detach())
 
         self.rewards.append(rewards.detach())
         self.dones.append(dones.detach())
         if values_comm is None:
             values_comm = torch.zeros_like(values_res)
+        if values_collab is None:
+            values_collab = torch.zeros_like(values_res)
+        if values_guide_scale is None:
+            values_guide_scale = torch.zeros_like(values_res)
+        if values_actuator is None:
+            values_actuator = torch.zeros_like(values_res)
         self.values_opt.append(values_opt.detach())
         self.values_cfg.append(values_cfg.detach())
         self.values_res.append(values_res.detach())
         self.values_comm.append(values_comm.detach())
+        self.values_collab.append(values_collab.detach())
+        self.values_guide_scale.append(values_guide_scale.detach())
+        self.values_actuator.append(values_actuator.detach())
         self.values_ref.append(values_ref.detach())
 
     def compute_returns_advantages(
@@ -92,6 +125,9 @@ class MAPPOBuffer:
         values_cfg = torch.stack(self.values_cfg, dim=0)  # [T,E,A]
         values_res = torch.stack(self.values_res, dim=0)  # [T,E,A]
         values_comm = torch.stack(self.values_comm, dim=0)  # [T,E,A]
+        values_collab = torch.stack(self.values_collab, dim=0)  # [T,E,A]
+        values_guide_scale = torch.stack(self.values_guide_scale, dim=0)  # [T,E,A]
+        values_actuator = torch.stack(self.values_actuator, dim=0)  # [T,E,A]
         values_ref = torch.stack(self.values_ref, dim=0)  # [T,E,A]
 
         next_ref = next_values["value_ref"]  # [E,A]
@@ -120,12 +156,18 @@ class MAPPOBuffer:
         adv_cfg = _normalize(returns - values_cfg)
         adv_res = _normalize(returns - values_res)
         adv_comm = _normalize(returns - values_comm)
+        adv_collab = _normalize(returns - values_collab)
+        adv_guide_scale = _normalize(returns - values_guide_scale)
+        adv_actuator = _normalize(returns - values_actuator)
 
         self.returns = returns
         self.adv_opt = adv_opt
         self.adv_cfg = adv_cfg
         self.adv_res = adv_res
         self.adv_comm = adv_comm
+        self.adv_collab = adv_collab
+        self.adv_guide_scale = adv_guide_scale
+        self.adv_actuator = adv_actuator
 
     def as_tensors(self, env_indices=None) -> Dict[str, torch.Tensor]:
         obs = torch.stack(self.obs, dim=0)  # [T,E,A,F]
@@ -137,11 +179,17 @@ class MAPPOBuffer:
         log_probs_cfg = torch.stack(self.log_probs_cfg, dim=0)  # [T,E,A]
         log_probs_res = torch.stack(self.log_probs_res, dim=0)  # [T,E,A]
         log_probs_comm = torch.stack(self.log_probs_comm, dim=0)  # [T,E,A]
+        log_probs_collab = torch.stack(self.log_probs_collab, dim=0)  # [T,E,A]
+        log_probs_guide_scale = torch.stack(self.log_probs_guide_scale, dim=0)  # [T,E,A]
+        log_probs_actuator = torch.stack(self.log_probs_actuator, dim=0)  # [T,E,A]
 
         values_opt = torch.stack(self.values_opt, dim=0)  # [T,E,A]
         values_cfg = torch.stack(self.values_cfg, dim=0)  # [T,E,A]
         values_res = torch.stack(self.values_res, dim=0)  # [T,E,A]
         values_comm = torch.stack(self.values_comm, dim=0)  # [T,E,A]
+        values_collab = torch.stack(self.values_collab, dim=0)  # [T,E,A]
+        values_guide_scale = torch.stack(self.values_guide_scale, dim=0)  # [T,E,A]
+        values_actuator = torch.stack(self.values_actuator, dim=0)  # [T,E,A]
         values_ref = torch.stack(self.values_ref, dim=0)  # [T,E,A]
 
         returns = self.returns  # [T,E,A]
@@ -149,6 +197,9 @@ class MAPPOBuffer:
         adv_cfg = self.adv_cfg  # [T,E,A]
         adv_res = self.adv_res  # [T,E,A]
         adv_comm = self.adv_comm  # [T,E,A]
+        adv_collab = self.adv_collab  # [T,E,A]
+        adv_guide_scale = self.adv_guide_scale  # [T,E,A]
+        adv_actuator = self.adv_actuator  # [T,E,A]
 
         if env_indices is not None:
             if isinstance(env_indices, int):
@@ -162,16 +213,25 @@ class MAPPOBuffer:
             log_probs_cfg = log_probs_cfg.index_select(1, idx)
             log_probs_res = log_probs_res.index_select(1, idx)
             log_probs_comm = log_probs_comm.index_select(1, idx)
+            log_probs_collab = log_probs_collab.index_select(1, idx)
+            log_probs_guide_scale = log_probs_guide_scale.index_select(1, idx)
+            log_probs_actuator = log_probs_actuator.index_select(1, idx)
             values_opt = values_opt.index_select(1, idx)
             values_cfg = values_cfg.index_select(1, idx)
             values_res = values_res.index_select(1, idx)
             values_comm = values_comm.index_select(1, idx)
+            values_collab = values_collab.index_select(1, idx)
+            values_guide_scale = values_guide_scale.index_select(1, idx)
+            values_actuator = values_actuator.index_select(1, idx)
             values_ref = values_ref.index_select(1, idx)
             returns = returns.index_select(1, idx)
             adv_opt = adv_opt.index_select(1, idx)
             adv_cfg = adv_cfg.index_select(1, idx)
             adv_res = adv_res.index_select(1, idx)
             adv_comm = adv_comm.index_select(1, idx)
+            adv_collab = adv_collab.index_select(1, idx)
+            adv_guide_scale = adv_guide_scale.index_select(1, idx)
+            adv_actuator = adv_actuator.index_select(1, idx)
 
         t, e, a, f = obs.shape
         g = global_obs.shape[-1]
@@ -185,10 +245,16 @@ class MAPPOBuffer:
             "old_log_probs_cfg_actor": log_probs_cfg.reshape(t * e * a),
             "old_log_probs_res_actor": log_probs_res.reshape(t * e * a),
             "old_log_probs_comm_actor": log_probs_comm.reshape(t * e * a),
+            "old_log_probs_collab_actor": log_probs_collab.reshape(t * e * a),
+            "old_log_probs_guide_scale_actor": log_probs_guide_scale.reshape(t * e * a),
+            "old_log_probs_actuator_actor": log_probs_actuator.reshape(t * e * a),
             "adv_opt_actor": adv_opt.reshape(t * e * a),
             "adv_cfg_actor": adv_cfg.reshape(t * e * a),
             "adv_res_actor": adv_res.reshape(t * e * a),
             "adv_comm_actor": adv_comm.reshape(t * e * a),
+            "adv_collab_actor": adv_collab.reshape(t * e * a),
+            "adv_guide_scale_actor": adv_guide_scale.reshape(t * e * a),
+            "adv_actuator_actor": adv_actuator.reshape(t * e * a),
             # critic side (env-level flatten, keep agent dim)
             "global_obs_critic": global_obs.reshape(t * e, g),
             "actions_critic": actions.reshape(t * e, a, self.action_cols),
@@ -197,6 +263,9 @@ class MAPPOBuffer:
             "old_values_cfg_critic": values_cfg.reshape(t * e, a),
             "old_values_res_critic": values_res.reshape(t * e, a),
             "old_values_comm_critic": values_comm.reshape(t * e, a),
+            "old_values_collab_critic": values_collab.reshape(t * e, a),
+            "old_values_guide_scale_critic": values_guide_scale.reshape(t * e, a),
+            "old_values_actuator_critic": values_actuator.reshape(t * e, a),
             "returns_critic": returns.reshape(t * e, a),
             # diagnostics
             "returns_all": returns,
@@ -205,8 +274,14 @@ class MAPPOBuffer:
             "adv_cfg_all": adv_cfg,
             "adv_res_all": adv_res,
             "adv_comm_all": adv_comm,
+            "adv_collab_all": adv_collab,
+            "adv_guide_scale_all": adv_guide_scale,
+            "adv_actuator_all": adv_actuator,
             "values_opt_all": values_opt,
             "values_cfg_all": values_cfg,
             "values_res_all": values_res,
             "values_comm_all": values_comm,
+            "values_collab_all": values_collab,
+            "values_guide_scale_all": values_guide_scale,
+            "values_actuator_all": values_actuator,
         }

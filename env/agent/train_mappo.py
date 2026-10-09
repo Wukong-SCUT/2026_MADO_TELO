@@ -12,8 +12,6 @@ Run from project root:
 
 import json
 import os
-from datetime import datetime
-from pathlib import Path
 
 import torch
 try:
@@ -23,8 +21,12 @@ except Exception:
 
 from options import get_options, resolve_mappo_obs_dim
 from options import build_options_snapshot
-from options import C8C_RELEASE_LATEST_TRAINING, RELEASE_ROOT
 from env.agent.mappo import MAPPOPolicy, MAPPOTrainer, MAPPORunner
+from env.agent.mappo.checkpoint import (
+    checkpoint_rng_state,
+    restore_rng_state,
+    torch_load_checkpoint,
+)
 from env.agent.utils.utils import set_random_seed
 
 
@@ -34,6 +36,11 @@ def main():
     if len(getattr(opts, "train_function_ids", [])) == 0:
         raise ValueError(
             "Missing training function ids. Please pass --train_function_ids (or --fun_ids alias)."
+        )
+    if int(opts.episode_steps) < 1:
+        raise ValueError(
+            "Training budget is too small for one rollout step: max_fes must be at least "
+            "fixed_agent_num * fixed_subfes_per_agent."
         )
     opts.use_cuda = 1 if (torch.cuda.is_available() and not opts.no_cuda) else 0
     opts.device = torch.device("cuda" if opts.use_cuda else "cpu")
@@ -50,6 +57,9 @@ def main():
     n_agents = int(opts.fixed_agent_num)
     action_dim = int(len(getattr(opts, "optimizer_profile_candidates", ["inherit", "conservative", "balanced", "aggressive"])))
 
+    if int(getattr(opts, "objective_split_d5_two_stage_actuator_enable", 0)) or int(getattr(opts, "objective_split_d6_pre_generator_selector_enable", 0)):
+        raise ValueError("This package contains only the selected MAPPO architecture.")
+
     policy = MAPPOPolicy(opts, obs_dim=obs_dim, n_agents=n_agents, action_dim=action_dim)
     trainer = MAPPOTrainer(opts, policy)
     print(f"[MAPPO Signature] current={getattr(policy, 'policy_signature_str', '')}")
@@ -59,8 +69,9 @@ def main():
     # - --load_path: load weights/optimizer but keep current epoch_start unless specified
     assert not (opts.resume and opts.load_path), "Only one of --resume and --load_path can be set."
     load_path = opts.resume if opts.resume else opts.load_path
+    resume_rng_state = None
     if load_path is not None:
-        ckpt = torch.load(load_path, map_location=policy.device)
+        ckpt = torch_load_checkpoint(load_path, map_location=policy.device)
         ckpt_sig = ckpt.get("policy_signature", None)
         cur_sig = getattr(policy, "policy_signature", None)
         if ckpt_sig is None:
@@ -90,6 +101,31 @@ def main():
             opts.epoch_start = max(int(opts.epoch_start), last_epoch + 1)
             print(f"[MAPPO] Resume from: {load_path}")
             print(f"[MAPPO] last_epoch={last_epoch}, new epoch_start={opts.epoch_start}, epoch_end={opts.epoch_end}")
+            resume_rng_state = checkpoint_rng_state(ckpt)
+            schedule = ckpt.get("training_schedule", None)
+            if isinstance(schedule, dict):
+                opts.resume_schedule_start_epoch = int(
+                    schedule.get("start_epoch", opts.epoch_start)
+                )
+                opts.resume_schedule_end_epoch = int(
+                    schedule.get("end_epoch", opts.epoch_end)
+                )
+                print(
+                    "[MAPPO Schedule] Restored original schedule axis: "
+                    f"start={opts.resume_schedule_start_epoch}, "
+                    f"end={opts.resume_schedule_end_epoch}"
+                )
+            if resume_rng_state is None:
+                print(
+                    "[MAPPO RNG] Legacy checkpoint has no complete RNG state; "
+                    "resume will preserve historical non-bitwise behavior."
+                )
+            if not isinstance(schedule, dict):
+                print(
+                    "[MAPPO Schedule] Legacy checkpoint has no original schedule "
+                    "axis; forced-optimizer scheduling keeps historical restart "
+                    "semantics."
+                )
         else:
             print(f"[MAPPO] Loaded checkpoint weights from: {load_path}")
 
@@ -102,38 +138,10 @@ def main():
             json.dump(args_dict, f, indent=2)
 
     runner = MAPPORunner(opts, policy, trainer, tb_logger=tb_logger)
+    if resume_rng_state is not None:
+        restored = restore_rng_state(resume_rng_state)
+        print(f"[MAPPO RNG] Restored checkpoint RNG state: {restored}")
     runner.train()
-
-    if not opts.no_saving:
-        model_dir = Path(opts.modal_save_dir).resolve()
-        required = {
-            "cdo_checkpoint": "mappo-epoch-20.pt",
-            "wsn_checkpoint": "mappo-epoch-24.pt",
-        }
-        missing = [name for name in required.values() if not (model_dir / name).is_file()]
-        if missing:
-            raise FileNotFoundError(
-                "Training finished without the release evaluation checkpoints: "
-                + ", ".join(missing)
-            )
-        pointer_path = Path(C8C_RELEASE_LATEST_TRAINING)
-        pointer_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            model_dir_value = str(model_dir.relative_to(Path(RELEASE_ROOT)))
-        except ValueError:
-            model_dir_value = str(model_dir)
-        pointer = {
-            "schema_version": 1,
-            "completed_at": datetime.now().isoformat(timespec="seconds"),
-            "run_name": str(opts.run_name),
-            "model_dir": model_dir_value,
-            **required,
-        }
-        tmp_path = pointer_path.with_suffix(".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(pointer, f, indent=2)
-        os.replace(tmp_path, pointer_path)
-        print(f"[C8c Release] Latest completed training recorded in: {pointer_path}")
 
 
 if __name__ == "__main__":

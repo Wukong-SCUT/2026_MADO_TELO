@@ -1,7 +1,7 @@
 from typing import Dict, List
 
-from benchmarks.cdo_f1f15.cdo_functions import Benchmark as CDOBenchF1F14Benchmark
-from benchmarks.cdo_f1f15.wsn_function import MASOIEWSNFunction
+from benchmark.cdo_bench_f1f14.benchmark import Benchmark as CDOBenchF1F14Benchmark
+from benchmark._cdo_f15_shared.benchmark import MASOIEWSNFunction
 
 
 class Benchmark:

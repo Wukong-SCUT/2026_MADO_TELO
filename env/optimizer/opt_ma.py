@@ -10,6 +10,9 @@ import numpy as np
 from gym import spaces
 
 from optimizers.unified_opt import create_optimizer
+from benchmark.cdo_bench_f1f14 import Benchmark as CDOBenchF1F14Benchmark
+from benchmark.cdo_bench_f1f15 import Benchmark as CDOBenchF1F15Benchmark
+from benchmark.wsn_localization import Benchmark as WSNBenchmark
 from env.agent.utils.utils import partition_p_and_s
 from options import get_options
 
@@ -109,18 +112,20 @@ class opt_ma(gym.Env):
         self.masoie_wsn_id_offset = int(getattr(self.opts, "masoie_wsn_id_offset", 200))
 
         self.problem_family, self.inner_question = self._resolve_problem_identity(self.question)
-        # Keep the release package self-contained: import only the selected
-        # benchmark instead of requiring every historical benchmark at startup.
         if self.problem_family == "WSNLocation":
-            from benchmarks.wsn_f1f5 import Benchmark
+            self.bench = WSNBenchmark(self.opts)
+        elif self.problem_family == "WSNLocationMASOIE":
+            raise ValueError("Standalone WSNLocationMASOIE is not included; use CDOBenchF1F15 function 15")
+        elif self.problem_family == "DBOF1F10":
+            raise ValueError("DBOF1F10 is not included in this package")
+        elif self.problem_family == "CDOCompetition":
+            raise ValueError("CDOCompetition is not included in this package")
+        elif self.problem_family == "CDOBenchF1F14":
+            self.bench = CDOBenchF1F14Benchmark(self.opts)
         elif self.problem_family == "CDOBenchF1F15":
-            from benchmarks.cdo_f1f15 import Benchmark
+            self.bench = CDOBenchF1F15Benchmark(self.opts)
         else:
-            raise ValueError(
-                "This C8c release supports benchmark_name=CDOBenchF1F15 or "
-                f"WSNLocation, got {self.problem_family!r}."
-            )
-        self.bench = Benchmark(self.opts)
+            raise ValueError("CEC2013LSGO is not included in this package")
         self.info = self.bench.get_info(self.inner_question)
         self.fun = self.bench.get_function(self.inner_question)
 
@@ -174,13 +179,43 @@ class opt_ma(gym.Env):
                 f"Please align fixed_agent_num or use function ids with consistent group counts."
             )
 
-        per_agent_nvec = np.asarray(
+        per_agent_nvec_parts = (
             [len(self.optimizer_candidates)]
             + [len(self.profile_candidates)] * self.cfg_param_num
-            + [len(self.resource_factors)],
-            dtype=np.int64,
+            + [len(self.resource_factors)]
         )
-        # Semantics: action shape is [n_agents, 2+cfg_param_num].
+        if bool(int(getattr(self.opts, "objective_split_comm_action_enable", 0))):
+            per_agent_nvec_parts.append(
+                len(getattr(self.opts, "objective_split_comm_round_candidates", [1]))
+            )
+        if bool(int(getattr(self.opts, "objective_split_collab_action_enable", 0))):
+            per_agent_nvec_parts.append(
+                len(getattr(self.opts, "objective_split_collab_modes", ["consensus"]))
+            )
+        if bool(int(getattr(self.opts, "objective_split_guide_scale_action_enable", 0))):
+            per_agent_nvec_parts.append(
+                len(getattr(self.opts, "objective_split_guide_scale_candidates", [1.0]))
+            )
+        if bool(
+            int(
+                getattr(
+                    self.opts,
+                    "objective_split_candidate_actuator_action_enable",
+                    0,
+                )
+            )
+        ):
+            per_agent_nvec_parts.append(
+                len(
+                    getattr(
+                        self.opts,
+                        "objective_split_candidate_actuator_candidates",
+                        [0.0, 0.25, 0.5],
+                    )
+                )
+            )
+        per_agent_nvec = np.asarray(per_agent_nvec_parts, dtype=np.int64)
+        # Semantics: action shape is [n_agents, len(per_agent_nvec)].
         self.action_space = spaces.MultiDiscrete(np.tile(per_agent_nvec, (self.n_agents, 1)))
         self.obs_dim = 16
         self.observation_space = spaces.Box(
@@ -304,6 +339,8 @@ class opt_ma(gym.Env):
 
     def _resolve_profile_name(self, agent_id: int, optimizer_name: str, profile_idx: int) -> str:
         p = self._profile_name(profile_idx)
+        if p == "numeric_inherit":
+            p = "inherit"
         if p != "inherit":
             return p
         cache_i = self.param_state_cache[int(agent_id)]
@@ -313,6 +350,8 @@ class opt_ma(gym.Env):
 
     def _resolve_level(self, agent_id: int, optimizer_name: str, level_idx: int, key: str) -> str:
         p = self._profile_name(level_idx)
+        if p == "numeric_inherit":
+            p = "inherit"
         if p != "inherit":
             return p
         cache_i = self.param_state_cache[int(agent_id)]

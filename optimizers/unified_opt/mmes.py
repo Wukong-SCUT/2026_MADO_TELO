@@ -134,6 +134,82 @@ class MMES(ES):
         self._w_2 = np.sqrt(self.c_s*(2.0 - self.c_s))
         # Numerical guard for non-finite objective values.
         self.nonfinite_penalty = float(options.get("nonfinite_penalty", 1e300))
+        self.optimizer_guide_enable = bool(options.get("optimizer_guide_enable", False))
+        self.optimizer_guide_strength = float(max(0.0, options.get("optimizer_guide_strength", 0.0)))
+        self.optimizer_guide_mix_strength = float(
+            max(0.0, options.get("optimizer_guide_mix_strength", self.optimizer_guide_strength))
+        )
+        self.optimizer_guide_direction = self._resolve_optimizer_guide(
+            options.get("optimizer_guide_direction", None)
+        )
+        self.optimizer_anchor_enable = bool(options.get("optimizer_anchor_enable", False))
+        self.optimizer_anchor_mix_strength = float(
+            max(0.0, options.get("optimizer_anchor_mix_strength", options.get("optimizer_anchor_strength", 0.0)))
+        )
+        self.optimizer_anchor_point = self._resolve_optimizer_anchor(
+            options.get("optimizer_anchor_point", None)
+        )
+        self.optimizer_anchor_applied = 0.0
+        self.optimizer_anchor_mean_step_norm = 0.0
+        self.optimizer_anchor_sample_applied = 0.0
+        self.optimizer_anchor_dist = 0.0
+        # 保底最少评估（F5 死锁修复）：初始化后若预算已被耗尽（如 B <= D 的情形），
+        # 强制执行恰好一批完整种群评估；仅 optimize() 内部使用，默认关闭。
+        self._force_one_iteration = False
+
+    def _resolve_optimizer_guide(self, raw):
+        if not self.optimizer_guide_enable:
+            return None
+        if raw is None:
+            return None
+        guide = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if guide.size != self.ndim_problem:
+            return None
+        norm = float(np.linalg.norm(guide))
+        if (not np.isfinite(norm)) or norm <= 1e-12:
+            return None
+        return guide / norm
+
+    def _resolve_optimizer_anchor(self, raw):
+        if not self.optimizer_anchor_enable:
+            return None
+        if raw is None:
+            return None
+        anchor = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if anchor.size != self.ndim_problem or not np.all(np.isfinite(anchor)):
+            return None
+        return self._repair_bounds(anchor)
+
+    def _anchor_direction_from(self, mean):
+        anchor = self.optimizer_anchor_point
+        if anchor is None:
+            return None
+        direction = np.asarray(anchor, dtype=np.float64).reshape(-1) - np.asarray(
+            mean, dtype=np.float64
+        ).reshape(-1)
+        dist = float(np.linalg.norm(direction))
+        if (not np.isfinite(dist)) or dist <= 1e-12:
+            return None
+        self.optimizer_anchor_dist = dist
+        return direction / dist
+
+    def _mix_optimizer_anchor_direction(self, own_direction, mean):
+        anchor_dir = self._anchor_direction_from(mean)
+        if anchor_dir is None:
+            return own_direction
+        own = np.asarray(own_direction, dtype=np.float64).reshape(-1)
+        own_norm = float(np.linalg.norm(own))
+        if (not np.isfinite(own_norm)) or own_norm <= 1e-12:
+            mixed = anchor_dir
+        else:
+            beta = float(np.clip(self.optimizer_anchor_mix_strength, 0.0, 1.0))
+            mixed = (1.0 - beta) * (own / own_norm) + beta * anchor_dir
+        mixed_norm = float(np.linalg.norm(mixed))
+        if (not np.isfinite(mixed_norm)) or mixed_norm <= 1e-12:
+            return own_direction
+        self.optimizer_anchor_applied = 1.0
+        self.optimizer_anchor_mean_step_norm = float(self.optimizer_anchor_mix_strength)
+        return mixed / mixed_norm
 
     def _repair_bounds(self, x: np.ndarray) -> np.ndarray:
         if (self.lower_boundary is None) or (self.upper_boundary is None):
@@ -161,6 +237,8 @@ class MMES(ES):
         p = np.zeros((self.ndim_problem,))  # evolution path
         w = 0.0
         q = np.zeros((self.m, self.ndim_problem))  # candidate direction vectors
+        if self.optimizer_guide_direction is not None and self.m > 0:
+            q[0] = self.optimizer_guide_direction
         t = np.zeros((self.m,))  # recorded generations
         v = np.arange(self.m)  # indexes to evolution paths
         y = np.tile(self._evaluate_fitness(mean, args), (self.n_individuals,))  # fitness
@@ -173,6 +251,14 @@ class MMES(ES):
         # 1. 批量生成所有必需的随机数
         # 一次性生成 z_0 (等同于代码中的 z) 的基础各向同性高斯部分
         # z_0 = self._z_1 * N(0, I)
+        if self.optimizer_guide_direction is not None and q is not None and q.shape[0] > 0:
+            beta = float(np.clip(self.optimizer_guide_mix_strength, 0.0, 1.0))
+            mixed = (1.0 - beta) * q[0] + beta * self.optimizer_guide_direction
+            mixed_norm = float(np.linalg.norm(mixed))
+            if np.isfinite(mixed_norm) and mixed_norm > 1e-12:
+                q[0] = mixed / mixed_norm
+        if self.optimizer_anchor_point is not None and q is not None and q.shape[0] > 0:
+            q[0] = self._mix_optimizer_anchor_direction(q[0], mean)
         z0 = self.rng_optimization.standard_normal((self._n_mirror_sampling, self.ndim_problem))
 
         # 2. 批量生成混合分量的系数和索引
@@ -208,10 +294,14 @@ class MMES(ES):
             x[self._n_mirror_sampling:self.n_individuals] = mean - self.sigma * z_final[:remaining]
 
         # Keep samples within search bounds to avoid runaway objective overflows.
+        if getattr(self, "_boundary_capture", False):
+            self._boundary_raw = np.copy(x)
         x = self._repair_bounds(x)
 
         # 7. 检查终止条件并批量计算适应度
-        if self._check_terminations():
+        # 保底最少评估：死锁情形（B <= D）下由 optimize() 置位的强制批跳过此检查，
+        # 保证每 event 至少一批种群评估；其余情形行为不变。
+        if self._check_terminations() and not self._force_one_iteration:
             return x, None  # 返回当前种群，y 将由 optimize 处理
 
         y = self._evaluate_fitness(x, args)  # 直接调用基类实现的批量评估
@@ -220,7 +310,8 @@ class MMES(ES):
         return x, y
 
     def _update_distribution(self, x=None, mean=None, p=None, w=None, q=None,
-                             t=None, v=None, y=None, y_bak=None):
+                             t=None, v=None, y=None, y_bak=None,
+                             neutralize_success=False):
         y = np.asarray(y, dtype=np.float64).reshape(-1)
         y_bak = np.asarray(y_bak, dtype=np.float64).reshape(-1)
 
@@ -240,8 +331,16 @@ class MMES(ES):
             v = np.append(np.append(v[:k_star], v[(k_star + 1):]), v[k_star])
             t[v[-1]], q[v[-1]] = self._n_generations, p
         # conduct success-based mutation strength adaptation
-        l_w = np.dot(self._w, y_bak[:self.n_parents] > y[:self.n_parents])
-        w = self._w_1*w + self._w_2*np.sqrt(self._mu_eff)*(2*l_w - 1)
+        if neutralize_success:
+            # An external commit moved the distribution centre, so the prior
+            # population fitness is no longer a valid paired comparison for
+            # the first generation in the new coordinate frame.  Preserve
+            # the accumulated statistic but apply decay only; do not invent
+            # success or failure credit from stale y_bak values.
+            w = self._w_1*w
+        else:
+            l_w = np.dot(self._w, y_bak[:self.n_parents] > y[:self.n_parents])
+            w = self._w_1*w + self._w_2*np.sqrt(self._mu_eff)*(2*l_w - 1)
         self.sigma *= np.exp(norm.cdf(w) - 1.0 + self.a_z)
         return mean, p, w, q, t, v
 
@@ -258,11 +357,22 @@ class MMES(ES):
         if np.asarray(mean).ndim != 1:
             raise ValueError(f"MMES expects mean to be 1D, got mean.shape={np.asarray(mean).shape}")
         self._print_verbose_info(fitness, y[0])
-        while not self.termination_signal:
+        # 保底最少评估（F5 死锁修复）：initialize 后预算即被耗尽（B <= D 的饥饿情形，
+        # 例如 F5 D=150 vs B=125）时，强制执行恰好一批完整种群评估与一次分布更新，
+        # 消除"零评估/零更新死锁"。B > D 时该标志恒为 False，行为与旧实现逐位一致；
+        # 初始化 D 记账、reported FEs 与其他 optimizer 均不受影响。
+        self._force_one_iteration = False
+        if self.n_function_evaluations >= self.max_function_evaluations:
+            self._force_one_iteration = True
+        while (not self.termination_signal) or self._force_one_iteration:
             y_bak = np.copy(y)
             # sample and evaluate offspring population
             x, y = self.iterate(x, mean, q, v, args)
-            if self._check_terminations():
+            forced = self._force_one_iteration
+            self._force_one_iteration = False
+            if forced and y is None:
+                break
+            if self._check_terminations() and not forced:
                 break
             if x.ndim != 2:
                 raise ValueError(f"MMES expects x to be 2D, got x.shape={x.shape}")
@@ -274,4 +384,12 @@ class MMES(ES):
         results = self._collect(fitness, y, mean)
         results['p'] = p
         results['w'] = w
+        results['optimizer_anchor_applied'] = float(self.optimizer_anchor_applied)
+        results['optimizer_anchor_mean_step_norm'] = float(
+            self.optimizer_anchor_mean_step_norm
+        )
+        results['optimizer_anchor_sample_applied'] = float(
+            self.optimizer_anchor_sample_applied
+        )
+        results['optimizer_anchor_dist'] = float(self.optimizer_anchor_dist)
         return results

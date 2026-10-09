@@ -27,7 +27,22 @@ class VKD:
         self.n_individuals = int(options.get("n_individuals", 4 + int(3 * np.log(max(2, self.ndim_problem)))))
         self.k_init = int(options.get("k_init", 0))
         self.kmax = int(options.get("kmax", max(0, self.ndim_problem - 1)))
+        self.vkd_ps_outlet_mode = str(options.get("vkd_ps_outlet_mode", "native")).lower()
+        if self.vkd_ps_outlet_mode not in {"native", "sigma", "shape", "both"}:
+            raise ValueError(f"Unsupported vkd_ps_outlet_mode: {self.vkd_ps_outlet_mode}")
         self.verbose = bool(options.get("verbose", False))
+        self.optimizer_guide_enable = bool(options.get("optimizer_guide_enable", False))
+        self.optimizer_guide_direction = options.get("optimizer_guide_direction", None)
+        self.optimizer_guide_strength = float(max(0.0, options.get("optimizer_guide_strength", 0.0)))
+        self.optimizer_guide_mix_strength = float(
+            max(0.0, options.get("optimizer_guide_mix_strength", self.optimizer_guide_strength))
+        )
+        self.optimizer_anchor_enable = bool(options.get("optimizer_anchor_enable", False))
+        self.optimizer_anchor_point = options.get("optimizer_anchor_point", None)
+        self.optimizer_anchor_strength = float(max(0.0, options.get("optimizer_anchor_strength", 0.0)))
+        self.optimizer_anchor_mix_strength = float(
+            max(0.0, options.get("optimizer_anchor_mix_strength", self.optimizer_anchor_strength))
+        )
 
     def _fitness_single(self, x):
         y = self.fitness_function(np.asarray(x, dtype=np.float64).reshape(1, -1))
@@ -80,6 +95,24 @@ class VKD:
                 "factor_diag_slope",
                 "cs",
                 "ds",
+                "vkd_ps_outlet_mode",
+                "vkd_boundary_update_mode",
+            ):
+                if key in self.options:
+                    opts[key] = self.options[key]
+            for key in (
+                "optimizer_guide_enable",
+                "optimizer_guide_direction",
+                "optimizer_guide_strength",
+                "optimizer_guide_mix_strength",
+                "optimizer_anchor_enable",
+                "optimizer_anchor_point",
+                "optimizer_anchor_strength",
+                "optimizer_anchor_mix_strength",
+                # Diagnostic-only jump window plumbing (no algorithmic effect).
+                "optimizer_numeric_forensics_enable",
+                "optimizer_numeric_forensics_dir",
+                "optimizer_numeric_forensics_jump_log10",
             ):
                 if key in self.options:
                     opts[key] = self.options[key]
@@ -138,4 +171,20 @@ class VKD:
             "kmax": int(final_kmax),
             "k": int(final_k),
             "k_active": int(final_k_active),
+            "vkd_boundary_update_mode": str(
+                getattr(vkd, "vkd_boundary_update_mode", self.options.get("vkd_boundary_update_mode", "native"))
+                if "vkd" in locals() else self.options.get("vkd_boundary_update_mode", "native")
+            ),
+            "optimizer_anchor_applied": float(
+                getattr(vkd, "optimizer_anchor_applied", 0.0) if "vkd" in locals() else 0.0
+            ),
+            "optimizer_anchor_mean_step_norm": float(
+                getattr(vkd, "optimizer_anchor_mean_step_norm", 0.0) if "vkd" in locals() else 0.0
+            ),
+            "optimizer_anchor_sample_applied": float(
+                getattr(vkd, "optimizer_anchor_sample_applied", 0.0) if "vkd" in locals() else 0.0
+            ),
+            "optimizer_anchor_dist": float(
+                getattr(vkd, "optimizer_anchor_dist", 0.0) if "vkd" in locals() else 0.0
+            ),
         }

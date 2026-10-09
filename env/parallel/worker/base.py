@@ -79,6 +79,22 @@ class EnvWorker(ABC):
         self.send(action)
         return self.recv()  # type: ignore
 
+    def prepare_step(self, action: np.ndarray):
+        """Run the prepare half of an explicitly two-stage environment step."""
+        raise NotImplementedError
+
+    def prepare_generator_step(self, action: np.ndarray):
+        """Prepare the D6 consensus-after, probe-before generator stage."""
+        raise NotImplementedError
+
+    def prepare_actuator_step(self, action: np.ndarray):
+        """Dispatch D6 generator actions and prepare verifier context."""
+        raise NotImplementedError
+
+    def commit_step(self, action: np.ndarray):
+        """Commit the second-stage action of an explicitly prepared step."""
+        raise NotImplementedError
+
     @staticmethod
     def wait(
         workers: List["EnvWorker"],

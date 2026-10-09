@@ -8,7 +8,7 @@ from optimizers.cmaes.sepcmaes import SEPCMAES
 
 class SepCMAESOpt:
     """
-    Wrapper that adapts the bundled SepCMAES implementation to unified_opt.
+    Wrapper that adapts optimizers.cmaes.SEPCMAES to unified_opt interface.
     """
 
     def __init__(self, problem: Dict, options: Dict):
@@ -53,8 +53,8 @@ class SepCMAESOpt:
         )
         return y
 
-    def optimize(self):
-        start_time = time.time()
+    def build_core_options(self) -> Dict:
+        """Translate unified wrapper options into native SepCMAES options."""
         sep_options = {
             "max_function_evaluations": int(self.max_function_evaluations),
             "seed_rng": int(self.seed_rng),
@@ -77,14 +77,57 @@ class SepCMAESOpt:
             c_cov = float(max(1e-12, c_cov_default * max(1e-6, self.cov_lr_scale)))
             c_s = float(max(1e-12, c_s_default * max(1e-6, self.c_s_scale)))
             sep_options.update({"c_cov": float(c_cov), "c_s": float(c_s)})
+        for key in (
+            "optimizer_guide_enable",
+            "optimizer_guide_direction",
+            "optimizer_guide_strength",
+            "optimizer_guide_injection_pairs",
+            "optimizer_guide_use_negative_pair",
+            "optimizer_guide_numeric_guard",
+            "optimizer_numeric_telemetry_enable",
+            "optimizer_numeric_counter_enable",
+            "optimizer_numeric_telemetry_dir",
+            "optimizer_numeric_telemetry_context",
+            "optimizer_guide_sigma_exp_clip",
+            "optimizer_guide_sigma_clip_ratio",
+            "optimizer_guide_sample_clip_ratio",
+            "optimizer_guide_internal_mode",
+            "optimizer_guide_internal_mean_lr",
+            "optimizer_guide_internal_path_lr",
+            "optimizer_guide_internal_cov_lr",
+            "optimizer_guide_internal_agree_cos_min",
+            "optimizer_guide_internal_max_step_ratio",
+            "optimizer_guide_internal_max_rel_step",
+            "optimizer_guide_internal_path_max_rel_norm",
+            "optimizer_guide_internal_cov_rank1_clip",
+            "optimizer_guide_internal_disable_sample_injection",
+            "optimizer_anchor_enable",
+            "optimizer_anchor_point",
+            "optimizer_anchor_strength",
+            "optimizer_anchor_mix_strength",
+            "optimizer_anchor_sample_ratio",
+            "optimizer_anchor_sample_clip_ratio",
+            "optimizer_anchor_mean_pull",
+            "optimizer_anchor_sample_injection",
+        ):
+            if key in self.options:
+                sep_options[key] = self.options[key]
+        return sep_options
 
+    def build_core_problem(self) -> Dict:
+        """Return the bounded/non-finite-safe problem used by the native core."""
+        return {
+            "fitness_function": self._fitness_batch,
+            "ndim_problem": int(self.ndim_problem),
+            "lower_boundary": self.lower_boundary,
+            "upper_boundary": self.upper_boundary,
+        }
+
+    def optimize(self):
+        start_time = time.time()
+        sep_options = self.build_core_options()
         opt = SEPCMAES(
-            problem={
-                "fitness_function": self._fitness_batch,
-                "ndim_problem": int(self.ndim_problem),
-                "lower_boundary": self.lower_boundary,
-                "upper_boundary": self.upper_boundary,
-            },
+            problem=self.build_core_problem(),
             options=sep_options,
         )
         res = opt.optimize()
@@ -97,4 +140,27 @@ class SepCMAESOpt:
             "y": np.asarray([res.get("best_so_far_y", np.inf)], dtype=np.float64),
             "mean": np.asarray(res.get("best_so_far_x", self.mean), dtype=np.float64).reshape(-1).copy(),
             "sigma": float(self.sigma),
+            "optimizer_guide_internal_applied": float(
+                res.get("optimizer_guide_internal_applied", 0.0)
+            ),
+            "optimizer_guide_internal_mean_step_norm": float(
+                res.get("optimizer_guide_internal_mean_step_norm", 0.0)
+            ),
+            "optimizer_guide_internal_alignment": float(
+                res.get("optimizer_guide_internal_alignment", 0.0)
+            ),
+            "optimizer_anchor_applied": float(res.get("optimizer_anchor_applied", 0.0)),
+            "optimizer_anchor_mean_step_norm": float(
+                res.get("optimizer_anchor_mean_step_norm", 0.0)
+            ),
+            "optimizer_anchor_sample_applied": float(
+                res.get("optimizer_anchor_sample_applied", 0.0)
+            ),
+            "optimizer_anchor_dist": float(res.get("optimizer_anchor_dist", 0.0)),
+            "optimizer_numeric_telemetry": list(
+                res.get("optimizer_numeric_telemetry", [])
+            ),
+            "optimizer_numeric_guard_counters": dict(
+                res.get("optimizer_numeric_guard_counters", {})
+            ),
         }

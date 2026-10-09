@@ -101,7 +101,58 @@ class VkdCma(object):
 
         # TPA Parameters
         self.cs = kwargs.get('cs', 0.3)
-        self.ds = kwargs.get('ds', np.sqrt(self.N))  # or 4 - 3/N 
+        self.ds = kwargs.get('ds', np.sqrt(self.N))  # or 4 - 3/N
+        self.vkd_ps_outlet_mode = str(kwargs.get('vkd_ps_outlet_mode', 'native')).lower()
+        if self.vkd_ps_outlet_mode not in {'native', 'sigma', 'shape', 'both'}:
+            raise ValueError(f"Unsupported vkd_ps_outlet_mode: {self.vkd_ps_outlet_mode}")
+        self.vkd_boundary_update_mode = str(
+            kwargs.get('vkd_boundary_update_mode', 'native')
+        ).lower()
+        if self.vkd_boundary_update_mode not in {'native', 'candidate_a'}:
+            raise ValueError(
+                f"Unsupported vkd_boundary_update_mode: {self.vkd_boundary_update_mode}"
+            )
+        self.diag_sigma_isolated = self.vkd_ps_outlet_mode in {'sigma', 'both'}
+        self.diag_shape_isolated = self.vkd_ps_outlet_mode in {'shape', 'both'}
+        self.diag_last_alpha = 0.0
+        self.diag_last_hsig = True
+        self.diag_last_sigma_consumer = 0.0
+        self.diag_last_shape_consumer = 0.0
+        self.vkd_record_detail = bool(kwargs.get('vkd_record_detail', False))
+        # Diagnostic-only jump window: keeps the previous/current/next generation
+        # around the first obvious sigma jump.  None disables every capture below.
+        self._jump = None
+        self._jump_last = None
+        self._origin_trace = None
+        self._origin_slot_id = -1
+        self._origin_identity = dict(kwargs.get('vkd_origin_trace_identity', {}))
+        self._origin_objective = dict(kwargs.get('vkd_origin_objective', {}))
+        if kwargs.get('vkd_origin_trace_dir'):
+            from optimizers.unified_opt.vkd_origin_trace import get_trace
+            self._origin_trace = get_trace(kwargs['vkd_origin_trace_dir'])
+        if bool(kwargs.get('optimizer_numeric_forensics_enable', False)):
+            from optimizers.cmaes.numeric_forensics import (
+                JumpWindow,
+                jump_alpha_gate,
+                jump_early_milestone,
+                jump_early_write,
+                jump_max_windows,
+                jump_mid_milestone,
+                jump_output_dir,
+                jump_target,
+                jump_threshold_log10,
+            )
+            context = kwargs.get('optimizer_numeric_forensics_context', {})
+            self._jump = JumpWindow(
+                'vkd', jump_output_dir(kwargs), jump_threshold_log10(kwargs),
+                context=(dict(context) if isinstance(context, dict) else {}),
+                target=jump_target(kwargs),
+                max_windows=jump_max_windows(kwargs),
+                alpha_gate=jump_alpha_gate(kwargs),
+                early_write=jump_early_write(kwargs),
+                early_milestone_log10=jump_early_milestone(kwargs),
+                mid_milestone_log10=jump_mid_milestone(kwargs),
+            )
         self.flg_injection = False
         self.ps = 0
 
@@ -131,6 +182,25 @@ class VkdCma(object):
 
         self.lb = kwargs.get('lb', -5 * np.ones(self.N))
         self.ub = kwargs.get('ub', 5 * np.ones(self.N))
+        self.optimizer_guide_enable = bool(kwargs.get("optimizer_guide_enable", False))
+        self.optimizer_guide_strength = float(max(0.0, kwargs.get("optimizer_guide_strength", 0.0)))
+        self.optimizer_guide_mix_strength = float(
+            max(0.0, kwargs.get("optimizer_guide_mix_strength", self.optimizer_guide_strength))
+        )
+        self.optimizer_guide_direction = self._resolve_optimizer_guide(
+            kwargs.get("optimizer_guide_direction", None)
+        )
+        self.optimizer_anchor_enable = bool(kwargs.get("optimizer_anchor_enable", False))
+        self.optimizer_anchor_mix_strength = float(
+            max(0.0, kwargs.get("optimizer_anchor_mix_strength", kwargs.get("optimizer_anchor_strength", 0.0)))
+        )
+        self.optimizer_anchor_point = self._resolve_optimizer_anchor(
+            kwargs.get("optimizer_anchor_point", None)
+        )
+        self.optimizer_anchor_applied = 0.0
+        self.optimizer_anchor_mean_step_norm = 0.0
+        self.optimizer_anchor_sample_applied = 0.0
+        self.optimizer_anchor_dist = 0.0
 
         # Initialize with xs if provided
         xs = None
@@ -177,6 +247,75 @@ class VkdCma(object):
             self.arx = np.zeros((self.lam, self.N))
             self.arf = np.zeros(self.lam)
 
+    def _resolve_optimizer_guide(self, raw):
+        if not self.optimizer_guide_enable:
+            return None
+        if raw is None:
+            return None
+        guide = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if guide.size != self.N:
+            return None
+        norm_guide = float(norm(guide))
+        if (not np.isfinite(norm_guide)) or norm_guide <= 1e-12:
+            return None
+        return guide / norm_guide
+
+    def _resolve_optimizer_anchor(self, raw):
+        if not self.optimizer_anchor_enable:
+            return None
+        if raw is None:
+            return None
+        anchor = np.asarray(raw, dtype=np.float64).reshape(-1)
+        if anchor.size != self.N or not np.all(np.isfinite(anchor)):
+            return None
+        return self._repair_bounds(anchor)
+
+    def _anchor_direction_from(self):
+        anchor = self.optimizer_anchor_point
+        if anchor is None:
+            return None
+        direction = np.asarray(anchor, dtype=np.float64).reshape(-1) - np.asarray(
+            self.xmean, dtype=np.float64
+        ).reshape(-1)
+        dist = float(norm(direction))
+        if (not np.isfinite(dist)) or dist <= 1e-12:
+            return None
+        self.optimizer_anchor_dist = dist
+        return direction / dist
+
+    def _mix_optimizer_anchor_direction(self, own_direction):
+        anchor_dir = self._anchor_direction_from()
+        if anchor_dir is None:
+            return own_direction
+        own = np.asarray(own_direction, dtype=np.float64).reshape(-1)
+        own_norm = float(norm(own))
+        if (not np.isfinite(own_norm)) or own_norm <= 1e-12:
+            mixed = anchor_dir
+        else:
+            beta = float(np.clip(self.optimizer_anchor_mix_strength, 0.0, 1.0))
+            mixed = (1.0 - beta) * (own / own_norm) + beta * anchor_dir
+        mixed_norm = float(norm(mixed))
+        if (not np.isfinite(mixed_norm)) or mixed_norm <= 1e-12:
+            return own_direction
+        self.optimizer_anchor_applied = 1.0
+        self.optimizer_anchor_mean_step_norm = float(self.optimizer_anchor_mix_strength)
+        return mixed / mixed_norm
+
+    def _mix_optimizer_guide_direction(self, own_direction):
+        guide = self.optimizer_guide_direction
+        if guide is None:
+            return own_direction
+        own = np.asarray(own_direction, dtype=np.float64).reshape(-1)
+        own_norm = float(norm(own))
+        if (not np.isfinite(own_norm)) or own_norm <= 1e-12:
+            return guide
+        beta = float(np.clip(self.optimizer_guide_mix_strength, 0.0, 1.0))
+        mixed = (1.0 - beta) * (own / own_norm) + beta * guide
+        mixed_norm = float(norm(mixed))
+        if (not np.isfinite(mixed_norm)) or mixed_norm <= 1e-12:
+            return own_direction
+        return mixed / mixed_norm
+
     # === 在 VkdCma 类中新增 ===
 
     def incorporate_generation(self, arx, arf):
@@ -202,7 +341,13 @@ class VkdCma(object):
         if not np.all(self.arf[idx[1:]] - self.arf[idx[:-1]] > 0.):
             warnings.warn("assumed no tie, but there exists", RuntimeWarning)
 
-        sary = ary[idx[:self.mu]]
+        if self.vkd_boundary_update_mode == 'candidate_a':
+            # Candidate A keeps ranking/fitness unchanged but makes every internal
+            # update use the positions that were actually scored after repair.
+            ary_for_update = (self.arx - self.xmean) / self.sigma
+        else:
+            ary_for_update = ary
+        sary = ary_for_update[idx[:self.mu]]
 
         # ------ Update xmean ------
         self.dx = np.dot(self.w, sary)
@@ -371,6 +516,125 @@ class VkdCma(object):
                 print(condition)
         return self.xmean
 
+    def _note_jump(self, idx, arf, ary_raw, arx_raw, alpha_act, sigma_consumer,
+                   shape_consumer, hsig, sigma_before, ps_before, xmean_before,
+                   clip_count, injection=True, dx_probe_used=None,
+                   probe_direction=None, probe_length=None, probe_mnorm=None,
+                   sigma_used_for_probe=None, xmean_used_for_probe=None):
+        """Diagnostic-only: feed one VKD generation into the first-jump window."""
+        try:
+            recorder = self._jump
+            if recorder is None:
+                return False
+            rank_pos = int(np.where(idx == 0)[0][0])
+            rank_neg = int(np.where(idx == 1)[0][0])
+            log10_growth = (
+                float(np.log10(float(self.sigma)) - np.log10(float(sigma_before)))
+                if sigma_before > 0.0 and float(self.sigma) > 0.0
+                else None
+            )
+            # Gate: sigma growth is the primary evidence.  |alpha|>=1 is a noisy
+            # navigation signal (alpha hits +-1 routinely), so it only opens a
+            # window when explicitly enabled, and never on its own for the target
+            # object's sustained growth.
+            jump = bool(
+                log10_growth is not None
+                and log10_growth > 0.0
+                and log10_growth >= float(recorder.threshold_log10)
+            ) or bool(
+                getattr(recorder, "alpha_gate", False)
+                and injection
+                and abs(float(alpha_act)) >= 1.0
+            )
+            payload = {
+                "identity": dict(getattr(recorder, "context", {}) or {}),
+                "generation_neval": int(self.neval),
+                "collection": {
+                    "phase": "vkd_onestep_after_sigma_update",
+                    "physical_fes": int(self.neval),
+                    "k": int(self.k),
+                    "k_active": int(self.k_active),
+                    "injection": bool(injection),
+                },
+                "lambda": int(self.lam),
+                "dimension": int(self.N),
+                "mu": int(self.mu),
+                "cs": float(self.cs),
+                "ds": float(self.ds),
+                "ps_outlet_mode": str(self.vkd_ps_outlet_mode),
+                "probe_positive_index": 0,
+                "probe_negative_index": 1,
+                "score_positive": float(arf[0]),
+                "score_negative": float(arf[1]),
+                "rank_positive_zero_based": rank_pos,
+                "rank_negative_zero_based": rank_neg,
+                "alpha_act": float(alpha_act),
+                "ary_positive": np.asarray(ary_raw[0], dtype=np.float64).tolist(),
+                "ary_negative": np.asarray(ary_raw[1], dtype=np.float64).tolist(),
+                "x_raw_positive": np.asarray(arx_raw[0], dtype=np.float64).tolist(),
+                "x_raw_negative": np.asarray(arx_raw[1], dtype=np.float64).tolist(),
+                "x_scored_positive": np.asarray(self.arx[0], dtype=np.float64).tolist(),
+                "x_scored_negative": np.asarray(self.arx[1], dtype=np.float64).tolist(),
+                "clip_distance_positive": float(
+                    np.linalg.norm(np.asarray(arx_raw[0]) - np.asarray(self.arx[0]))
+                ),
+                "clip_distance_negative": float(
+                    np.linalg.norm(np.asarray(arx_raw[1]) - np.asarray(self.arx[1]))
+                ),
+                "clip_coordinates": int(clip_count),
+                "candidate_coordinates": int(self.arx.size),
+                "ps_before": float(ps_before),
+                "ps_after": float(self.ps),
+                "sigma_consumer": float(sigma_consumer),
+                "shape_consumer": float(shape_consumer),
+                "hsig": bool(hsig),
+                "sigma_before": float(sigma_before),
+                "sigma_after": float(self.sigma),
+                "sigma_log10_growth": log10_growth,
+                "sigma_used_for_probe": (
+                    None if sigma_used_for_probe is None else float(sigma_used_for_probe)
+                ),
+                "xmean_before": np.asarray(xmean_before, dtype=np.float64).tolist(),
+                "xmean_used_for_probe": (
+                    None if xmean_used_for_probe is None
+                    else np.asarray(xmean_used_for_probe, dtype=np.float64).tolist()
+                ),
+                "dx": np.asarray(self.dx, dtype=np.float64).tolist(),
+                "dx_probe_used": (
+                    None if dx_probe_used is None
+                    else np.asarray(dx_probe_used, dtype=np.float64).tolist()
+                ),
+                "probe_direction_used": (
+                    None if probe_direction is None
+                    else np.asarray(probe_direction, dtype=np.float64).tolist()
+                ),
+                "probe_length": None if probe_length is None else float(probe_length),
+                "probe_mahalanobis_norm": (
+                    None if probe_mnorm is None else float(probe_mnorm)
+                ),
+                "pc_norm": float(np.linalg.norm(self.pc)),
+                "D_rms": float(np.sqrt(np.mean(np.square(self.D)))),
+                "fitness_all": np.asarray(arf, dtype=np.float64).tolist(),
+                "ranking_all": [int(v) for v in np.asarray(idx).reshape(-1)],
+            }
+            self._jump_last = dict(payload)
+            return recorder.note(key=id(self), payload=payload, jump=jump,
+                                 growth_log10=log10_growth)
+        except Exception:
+            return False
+
+    def flush_jump_window(self, tag: str) -> bool:
+        """Diagnostic-only: keep the newest VKD state when the run is about to fail."""
+        recorder = self._jump
+        if recorder is None or self._jump_last is None:
+            return False
+        try:
+            return bool(
+                recorder.flush_latest(str(tag), records=[None, dict(self._jump_last)])
+            )
+        except Exception:
+            return False
+
     def _repair_bounds(self, x):
         """Clip individuals to remain within [lb, ub] bounds."""
         return np.clip(x, self.lb, self.ub)
@@ -382,6 +646,26 @@ class VkdCma(object):
 
         k = self.k
         ka = self.k_active
+        _jump = self._jump
+        _origin = self._origin_trace
+        if _origin is not None and not _origin.wants_generation(self._origin_identity):
+            _origin = None
+        if _jump is not None:
+            # Diagnostic snapshots taken before any control-path update below.
+            _jump_sigma_before = float(self.sigma)
+            _jump_ps_before = float(self.ps)
+            _jump_xmean_before = np.copy(self.xmean)
+        if _origin is not None:
+            _origin_before = {
+                'mean': np.copy(self.xmean), 'sigma': float(self.sigma),
+                'ps': float(self.ps), 'pc': np.copy(self.pc),
+                'dx': np.copy(self.dx), 'D': np.copy(self.D),
+                'V': np.copy(self.V), 'S': np.copy(self.S),
+                'k': int(self.k), 'k_active': int(self.k_active),
+                'flg_injection': bool(self.flg_injection),
+                'cone': float(self.cone), 'cmu': float(self.cmu),
+                'cc': float(self.cc), 'mueff': float(self.mueff),
+            }
 
         # Sampling
         if True:
@@ -401,12 +685,48 @@ class VkdCma(object):
             ary *= self.D
 
         # Injection
+        _jump_dx_used = None
+        _jump_probe_dir = None
+        _jump_probe_len = None
+        _jump_probe_mnorm = None
+        _jump_sigma_probe = None
+        _jump_xmean_probe = None
         if self.flg_injection:
             mnorm = self._mahalanobis_square_norm(self.dx)
-            dy = (norm(randn(self.N)) / sqrt(mnorm)) * self.dx
+            inject_direction = self._mix_optimizer_guide_direction(self.dx)
+            inject_direction = self._mix_optimizer_anchor_direction(inject_direction)
+            mnorm = max(1e-300, self._mahalanobis_square_norm(inject_direction))
+            probe_len = norm(randn(self.N)) / sqrt(mnorm)
+            if _jump is not None:
+                # Diagnostic copies of the probe construction state: the pre-update
+                # dx, the mixed direction, its Mahalanobis norm and the drawn length.
+                _jump_dx_used = np.copy(self.dx)
+                _jump_probe_dir = np.copy(inject_direction)
+                _jump_probe_len = float(probe_len)
+                _jump_probe_mnorm = float(mnorm)
+                _jump_sigma_probe = float(self.sigma)
+                _jump_xmean_probe = np.copy(self.xmean)
+            dy = probe_len * inject_direction
             ary[0] = dy
             ary[1] = -dy
         self.arx = self.xmean + self.sigma * ary
+        if getattr(self, "_boundary_capture", False):
+            self._boundary_raw = np.copy(self.arx)
+        if _origin is not None:
+            _origin_raw = np.copy(self.arx)
+        if _jump is not None:
+            # Raw (pre-repair) candidate positions; the repair below is what is scored.
+            _jump_arx_raw = np.copy(self.arx)
+            _jump_ary = np.copy(ary)
+            _jump_clip_count = int(np.count_nonzero(
+                (self.arx < self.lb) | (self.arx > self.ub)
+            ))
+        if self.vkd_record_detail:
+            self.diag_raw_candidate_finite = bool(np.isfinite(self.arx).all())
+            self.diag_clip_coordinates = int(np.count_nonzero(
+                (self.arx < self.lb) | (self.arx > self.ub)
+            ))
+            self.diag_candidate_coordinates = int(self.arx.size)
 
         self.arx = self._repair_bounds(self.arx)
 
@@ -435,7 +755,13 @@ class VkdCma(object):
         if not np.all(self.arf[idx[1:]] - self.arf[idx[:-1]] > 0.):
             warnings.warn("assumed no tie, but there exists", RuntimeWarning)
 
-        sary = ary[idx[:self.mu]]
+        if self.vkd_boundary_update_mode == 'candidate_a':
+            # Candidate A keeps ranking/fitness unchanged but makes every internal
+            # update use the positions that were actually scored after repair.
+            ary_for_update = (self.arx - self.xmean) / self.sigma
+        else:
+            ary_for_update = ary
+        sary = ary_for_update[idx[:self.mu]]
 
         # Update xmean
         self.dx = np.dot(self.w, sary)
@@ -446,14 +772,59 @@ class VkdCma(object):
         if self.flg_injection:
             alpha_act = np.where(idx == 1)[0][0] - np.where(idx == 0)[0][0]
             alpha_act /= float(self.lam - 1)
+            self.diag_last_alpha = float(alpha_act)
             self.ps += self.cs * (alpha_act - self.ps)
-            # assert abs(self.sigma) < 1e5
-            # print(str(self.sigma) ,end= '\r')
-            self.sigma *= exp(self.ps / self.ds)
-            hsig = self.ps < 0.5
+            sigma_consumer = self.cs * alpha_act if self.diag_sigma_isolated else self.ps
+            shape_consumer = self.cs * alpha_act if self.diag_shape_isolated else self.ps
+            self.diag_last_sigma_consumer = float(sigma_consumer)
+            self.diag_last_shape_consumer = float(shape_consumer)
+            self.sigma *= exp(sigma_consumer / self.ds)
+            hsig = shape_consumer < 0.5
+            self.diag_last_hsig = bool(hsig)
+            if _jump is not None:
+                self._note_jump(
+                    idx=idx, arf=np.asarray(self.arf, dtype=np.float64),
+                    ary_raw=_jump_ary, arx_raw=_jump_arx_raw,
+                    alpha_act=float(alpha_act), sigma_consumer=float(sigma_consumer),
+                    shape_consumer=float(shape_consumer), hsig=bool(hsig),
+                    sigma_before=float(_jump_sigma_before),
+                    ps_before=float(_jump_ps_before),
+                    xmean_before=_jump_xmean_before,
+                    clip_count=int(_jump_clip_count),
+                    dx_probe_used=_jump_dx_used,
+                    probe_direction=_jump_probe_dir,
+                    probe_length=_jump_probe_len,
+                    probe_mnorm=_jump_probe_mnorm,
+                    sigma_used_for_probe=_jump_sigma_probe,
+                    xmean_used_for_probe=_jump_xmean_probe,
+                )
         else:
             self.flg_injection = True
+            self.diag_last_alpha = 0.0
+            self.diag_last_sigma_consumer = float(self.ps)
+            self.diag_last_shape_consumer = float(self.ps)
+            self.diag_last_hsig = True
             hsig = True
+            if _jump is not None:
+                # First generation: no sigma update yet, but keep it as the window's
+                # "previous" record so the jump can be recomputed from one generation back.
+                self._note_jump(
+                    idx=idx, arf=np.asarray(self.arf, dtype=np.float64),
+                    ary_raw=_jump_ary, arx_raw=_jump_arx_raw,
+                    alpha_act=0.0, sigma_consumer=float(self.ps),
+                    shape_consumer=float(self.ps), hsig=True,
+                    sigma_before=float(_jump_sigma_before),
+                    ps_before=float(_jump_ps_before),
+                    xmean_before=_jump_xmean_before,
+                    clip_count=int(_jump_clip_count),
+                    injection=False,
+                    dx_probe_used=_jump_dx_used,
+                    probe_direction=_jump_probe_dir,
+                    probe_length=_jump_probe_len,
+                    probe_mnorm=_jump_probe_mnorm,
+                    sigma_used_for_probe=_jump_sigma_probe,
+                    xmean_used_for_probe=_jump_xmean_probe,
+                )
 
 
         # with writer.as_default():
@@ -591,6 +962,45 @@ class VkdCma(object):
         gmean_eig = exp(self._get_log_determinant_of_cov() / self.N / 2.0)
         self.D /= gmean_eig
         self.pc /= gmean_eig
+        if _origin is not None:
+            try:
+                identity = dict(self._origin_identity, slot_id=int(self._origin_slot_id))
+                raw = _origin_raw
+                scored = self.arx
+                clipped = int(np.count_nonzero(raw != scored))
+                scalars = {
+                    'clip_coordinates': clipped,
+                    'center_oob': bool(np.any((self.xmean < self.lb) | (self.xmean > self.ub))),
+                    'sigma_before': _origin_before['sigma'], 'sigma_after': float(self.sigma),
+                    'alpha': float(self.diag_last_alpha),
+                    'scored_probes': np.asarray(scored[:2]).copy(),
+                }
+                def payload():
+                    return {
+                        'identity': identity, 'generation_neval': int(self.neval),
+                        'objective': self._origin_objective,
+                        'before': _origin_before,
+                        'after': {'mean': np.copy(self.xmean), 'sigma': float(self.sigma),
+                                  'ps': float(self.ps), 'pc': np.copy(self.pc),
+                                  'dx': np.copy(self.dx), 'D': np.copy(self.D),
+                                  'V': np.copy(self.V), 'S': np.copy(self.S),
+                                  'k': int(self.k), 'k_active': int(self.k_active)},
+                        'ary': np.copy(ary), 'raw_candidates': np.copy(raw),
+                        'scored_candidates': np.copy(scored),
+                        'fitness': np.copy(self.arf), 'ranking': np.copy(idx),
+                        'weights': np.copy(self.w), 'cm': float(self.cm),
+                        'sqrtw': np.copy(self.sqrtw),
+                        'cs': float(self.cs), 'ds': float(self.ds),
+                        'alpha': float(self.diag_last_alpha),
+                        'sigma_consumer': float(self.diag_last_sigma_consumer),
+                        'shape_consumer': float(self.diag_last_shape_consumer),
+                        'hsig': bool(self.diag_last_hsig),
+                        'clip_coordinates': clipped,
+                        'vkd_boundary_update_mode': str(self.vkd_boundary_update_mode),
+                    }
+                _origin.note_generation(identity, scalars, payload)
+            except Exception:
+                pass
 
     def _mahalanobis_square_norm(self, dx):
         """Square norm of dx w.r.t. C = D*(I + V*S*V^t)*D

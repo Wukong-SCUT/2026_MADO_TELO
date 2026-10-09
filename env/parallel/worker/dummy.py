@@ -37,6 +37,39 @@ class DummyEnvWorker(EnvWorker):
         else:
             self.result = self.env.step(action)
 
+    def prepare_step(self, action: np.ndarray):
+        return self.env.prepare_step(action)
+
+    def prepare_generator_step(self, action: np.ndarray):
+        self.send_prepare_generator_step(action)
+        return self.recv_prepare_generator_step()
+
+    def send_prepare_generator_step(self, action: np.ndarray) -> None:
+        self.result = self.env.prepare_generator_step(action)
+
+    def recv_prepare_generator_step(self):
+        return self.result
+
+    def prepare_actuator_step(self, action: np.ndarray):
+        self.send_prepare_actuator_step(action)
+        return self.recv_prepare_actuator_step()
+
+    def send_prepare_actuator_step(self, action: np.ndarray) -> None:
+        self.result = self.env.prepare_actuator_step(action)
+
+    def recv_prepare_actuator_step(self):
+        return self.result
+
+    def commit_step(self, action: np.ndarray):
+        self.send_commit_step(action)
+        return self.recv_commit_step()
+
+    def send_commit_step(self, action: np.ndarray) -> None:
+        self.result = self.env.commit_step(action)
+
+    def recv_commit_step(self):
+        return self.result
+
     def seed(self, seed: Optional[int] = None) -> List[int]:
         super().seed(seed)
         return self.env.seed(seed)

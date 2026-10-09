@@ -131,6 +131,24 @@ class WSNFunction:
         aid = int(agent_id)
         if aid < 0 or aid >= self.node_num:
             raise ValueError(f"agent_id out of range: {aid}, node_num={self.node_num}")
+        residuals = self.local_target_residual_batch(aid, x_batch)
+        return np.sum(residuals, axis=1).astype(np.float64, copy=False)
+
+    def local_target_residual_batch(
+        self,
+        agent_id: int,
+        x_batch: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Per-target sensor-local squared residuals.
+
+        Shape:
+          x_batch: [N,D] or [D]
+          return:  [N,target_num]
+        """
+        aid = int(agent_id)
+        if aid < 0 or aid >= self.node_num:
+            raise ValueError(f"agent_id out of range: {aid}, node_num={self.node_num}")
         x = np.asarray(x_batch, dtype=np.float64)
         if x.ndim == 1:
             x = x[None, :]
@@ -145,10 +163,10 @@ class WSNFunction:
         pred = _measurement_rss_log(dist)
         err2 = (pred - self.observed[aid][None, :]) ** 2
         if self.metric_mode == "ccsa_readme":
-            local_vals = np.sum(err2, axis=1)
+            residuals = err2
         else:
-            local_vals = np.mean(err2, axis=1)
-        return local_vals.astype(np.float64, copy=False)
+            residuals = err2 / float(max(1, self.target_num))
+        return residuals.astype(np.float64, copy=False)
 
     def global_eval(self, x):
         return self.__call__(x)

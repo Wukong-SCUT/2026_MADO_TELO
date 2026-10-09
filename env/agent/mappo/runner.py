@@ -12,6 +12,7 @@ from env.agent.utils.logger import TrainingLogger
 from env.parallel.venvs import SubprocVectorEnv
 from env.optimizer.env_factory import make_opt_env
 from .buffer import MAPPOBuffer
+from .checkpoint import MAPPO_RNG_STATE_VERSION, capture_rng_state
 
 
 class MAPPORunner:
@@ -27,6 +28,15 @@ class MAPPORunner:
         self.start_epoch = int(opts.epoch_start)
         self.end_epoch = int(opts.epoch_end)
         self.train_epochs = int(max(0, self.end_epoch - self.start_epoch))
+        self.schedule_start_epoch = int(
+            getattr(opts, "resume_schedule_start_epoch", self.start_epoch)
+        )
+        self.schedule_end_epoch = int(
+            getattr(opts, "resume_schedule_end_epoch", self.end_epoch)
+        )
+        self.schedule_train_epochs = int(
+            max(0, self.schedule_end_epoch - self.schedule_start_epoch)
+        )
         self.horizon = int(opts.episode_steps)
         self.action_dim = int(len(getattr(opts, "optimizer_profile_candidates", ["inherit", "conservative", "balanced", "aggressive"])))  # profile head bins
         self.mappo_action_arch = str(getattr(opts, "mappo_action_arch", "current")).lower()
@@ -36,6 +46,29 @@ class MAPPORunner:
         self.comm_action_enable = bool(
             int(getattr(opts, "objective_split_comm_action_enable", 0))
         )
+        self.legacy_comm_old_logp_zero = bool(
+            int(getattr(opts, "mappo_legacy_comm_old_logp_zero", 0))
+        )
+        if self.legacy_comm_old_logp_zero and not self.comm_action_enable:
+            raise ValueError(
+                "mappo_legacy_comm_old_logp_zero=1 requires "
+                "objective_split_comm_action_enable=1."
+            )
+        self.collab_action_enable = bool(
+            int(getattr(opts, "objective_split_collab_action_enable", 0))
+        )
+        self.guide_scale_action_enable = bool(
+            int(getattr(opts, "objective_split_guide_scale_action_enable", 0))
+        )
+        self.actuator_action_enable = bool(
+            int(
+                getattr(
+                    opts,
+                    "objective_split_candidate_actuator_action_enable",
+                    0,
+                )
+            )
+        )
         raw_comm_candidates = getattr(opts, "objective_split_comm_round_candidates", [1, 2, 4, 8])
         if isinstance(raw_comm_candidates, str):
             raw_comm_candidates = [x.strip() for x in raw_comm_candidates.split(",") if x.strip()]
@@ -44,7 +77,53 @@ class MAPPORunner:
             if self.comm_action_enable
             else 1
         )
-        self.action_cols = int(2 + self.cfg_param_num + (1 if self.comm_action_enable else 0))
+        raw_collab_modes = getattr(opts, "objective_split_collab_modes", ["consensus", "self", "leader", "soft_diversify"])
+        if isinstance(raw_collab_modes, str):
+            raw_collab_modes = [x.strip() for x in raw_collab_modes.split(",") if x.strip()]
+        raw_guide_scale_candidates = getattr(opts, "objective_split_guide_scale_candidates", [1.0, 0.5, 0.75, 1.25])
+        if isinstance(raw_guide_scale_candidates, str):
+            raw_guide_scale_candidates = [x.strip() for x in raw_guide_scale_candidates.split(",") if x.strip()]
+        self.collab_action_dim = (
+            int(max(1, len(list(raw_collab_modes))))
+            if self.collab_action_enable
+            else 1
+        )
+        self.guide_scale_action_dim = (
+            int(max(1, len(list(raw_guide_scale_candidates))))
+            if self.guide_scale_action_enable
+            else 1
+        )
+        raw_actuator_candidates = getattr(
+            opts,
+            "objective_split_candidate_actuator_candidates",
+            [0.0, 0.25, 0.5],
+        )
+        if isinstance(raw_actuator_candidates, str):
+            raw_actuator_candidates = [
+                x.strip() for x in raw_actuator_candidates.split(",") if x.strip()
+            ]
+        self.actuator_action_dim = (
+            int(max(1, len(list(raw_actuator_candidates))))
+            if self.actuator_action_enable
+            else 1
+        )
+        self.forced_actuator_idx = int(
+            getattr(
+                opts,
+                "objective_split_candidate_actuator_forced_action",
+                -1,
+            )
+        )
+        if not self.actuator_action_enable:
+            self.forced_actuator_idx = -1
+        self.action_cols = int(
+            2
+            + self.cfg_param_num
+            + (1 if self.comm_action_enable else 0)
+            + (1 if self.collab_action_enable else 0)
+            + (1 if self.guide_scale_action_enable else 0)
+            + (1 if self.actuator_action_enable else 0)
+        )
         self.opt_action_dim = int(len(getattr(opts, "optimizer_candidates", ["mmes", "vkd"])))
         self.res_action_dim = int(len(getattr(opts, "resource_factors", [0.5, 1.0, 2.0])))
         self.optimizer_candidates = [str(x).lower() for x in getattr(opts, "optimizer_candidates", ["mmes", "vkd"])]
@@ -61,6 +140,21 @@ class MAPPORunner:
         self.comm_ratio_keys = (
             [f"comm_ratio_{i}" for i in range(self.comm_action_dim)]
             if self.comm_action_enable
+            else []
+        )
+        self.collab_ratio_keys = (
+            [f"collab_ratio_{i}" for i in range(self.collab_action_dim)]
+            if self.collab_action_enable
+            else []
+        )
+        self.guide_scale_ratio_keys = (
+            [f"guide_scale_ratio_{i}" for i in range(self.guide_scale_action_dim)]
+            if self.guide_scale_action_enable
+            else []
+        )
+        self.actuator_ratio_keys = (
+            [f"actuator_ratio_{i}" for i in range(self.actuator_action_dim)]
+            if self.actuator_action_enable
             else []
         )
         self.stats_header = self._build_stats_header()
@@ -95,45 +189,72 @@ class MAPPORunner:
             "policy_loss_cfg",
             "policy_loss_res",
             "policy_loss_comm",
+            "policy_loss_collab",
+            "policy_loss_guide_scale",
+            "policy_loss_actuator",
             "value_loss",
             "value_loss_ref",
             "value_loss_opt",
             "value_loss_cfg",
             "value_loss_res",
             "value_loss_comm",
+            "value_loss_collab",
+            "value_loss_guide_scale",
+            "value_loss_actuator",
             "entropy",
             "entropy_opt",
             "entropy_cfg",
             "entropy_res",
             "entropy_comm",
+            "entropy_collab",
+            "entropy_guide_scale",
+            "entropy_actuator",
             "approx_kl",
             "approx_kl_opt",
             "approx_kl_cfg",
             "approx_kl_res",
             "approx_kl_comm",
+            "approx_kl_collab",
+            "approx_kl_guide_scale",
+            "approx_kl_actuator",
             "clip_frac",
             "clip_frac_opt",
             "clip_frac_cfg",
             "clip_frac_res",
             "clip_frac_comm",
+            "clip_frac_collab",
+            "clip_frac_guide_scale",
+            "clip_frac_actuator",
             "ratio_mean",
             "ratio_std",
             "ratio_mean_opt",
             "ratio_mean_cfg",
             "ratio_mean_res",
             "ratio_mean_comm",
+            "ratio_mean_collab",
+            "ratio_mean_guide_scale",
+            "ratio_mean_actuator",
             "ratio_std_opt",
             "ratio_std_cfg",
             "ratio_std_res",
             "ratio_std_comm",
+            "ratio_std_collab",
+            "ratio_std_guide_scale",
+            "ratio_std_actuator",
             "delta_logp_opt_mean",
             "delta_logp_cfg_mean",
             "delta_logp_res_mean",
             "delta_logp_comm_mean",
+            "delta_logp_collab_mean",
+            "delta_logp_guide_scale_mean",
+            "delta_logp_actuator_mean",
             "delta_logp_opt_std",
             "delta_logp_cfg_std",
             "delta_logp_res_std",
             "delta_logp_comm_std",
+            "delta_logp_collab_std",
+            "delta_logp_guide_scale_std",
+            "delta_logp_actuator_std",
             "adv_opt_mean",
             "adv_opt_std",
             "adv_cfg_mean",
@@ -142,6 +263,12 @@ class MAPPORunner:
             "adv_res_std",
             "adv_comm_mean",
             "adv_comm_std",
+            "adv_collab_mean",
+            "adv_collab_std",
+            "adv_guide_scale_mean",
+            "adv_guide_scale_std",
+            "adv_actuator_mean",
+            "adv_actuator_std",
             "adv_mean",
             "adv_std",
             "ret_mean",
@@ -174,6 +301,94 @@ class MAPPORunner:
             "ccsa_scale_std",
             "masoie_velocity_norm_mean",
             "masoie_neighbor_pull_norm_mean",
+            "optimizer_guide_norm_mean",
+            "optimizer_guide_norm_max",
+            "optimizer_guide_applied_ratio",
+            "optimizer_guide_alignment_mean",
+            "optimizer_guide_source_active_ratio",
+            "optimizer_guide_internal_active_ratio",
+            "optimizer_guide_internal_mean_step_norm_mean",
+            "optimizer_guide_internal_mean_step_norm_max",
+            "optimizer_guide_internal_alignment_mean",
+            "anchor_enabled",
+            "anchor_applied_ratio",
+            "anchor_dist_mean",
+            "anchor_dist_max",
+            "anchor_direction_norm_mean",
+            "anchor_direction_norm_max",
+            "optimizer_anchor_applied_ratio",
+            "optimizer_anchor_mean_step_norm_mean",
+            "optimizer_anchor_mean_step_norm_max",
+            "optimizer_anchor_sample_applied_ratio",
+            "committee_supported",
+            "committee_active",
+            "committee_selection_target_block",
+            "committee_best_score_mean",
+            "committee_best_score_max",
+            "committee_confidence_mean",
+            "committee_confidence_max",
+            "committee_guide_norm_mean",
+            "committee_guide_norm_max",
+            "committee_self_source_ratio",
+            "committee_source_diversity_mean",
+            "committee_source_diversity_max",
+            "committee_shadow_whole_report_f",
+            "committee_shadow_target_block_report_f",
+            "committee_shadow_whole_report_win",
+            "committee_shadow_target_block_report_win",
+            "committee_shadow_whole_report_log_improve",
+            "committee_shadow_target_block_report_log_improve",
+            "committee_shadow_whole_agent_f_mean",
+            "committee_shadow_whole_agent_f_min",
+            "committee_shadow_target_block_agent_f_mean",
+            "committee_shadow_target_block_agent_f_min",
+            "committee_shadow_whole_agent_win_ratio",
+            "committee_shadow_target_block_agent_win_ratio",
+            "committee_shadow_target_block_win_vs_whole",
+            "committee_acceptance_supported",
+            "committee_acceptance_ratio",
+            "committee_rejected_ratio",
+            "committee_candidate_report_f",
+            "committee_candidate_global_f_mean",
+            "committee_candidate_global_f_min",
+            "committee_candidate_vs_report_log_improve",
+            "committee_effective_beta_mean",
+            "committee_effective_beta_max",
+            "committee_base_alignment_mean",
+            "committee_noop_ratio",
+            "candidate_response_supported",
+            "candidate_response_active",
+            "candidate_response_actuated",
+            "candidate_response_probe_active_ratio",
+            "candidate_response_generator_active_ratio",
+            "candidate_response_accept_ratio",
+            "candidate_response_selection_confidence_mean",
+            "candidate_response_support_mean",
+            "candidate_response_confidence_mean",
+            "candidate_response_trust_radius_mean",
+            "candidate_response_probe_radius_mean",
+            "candidate_response_requested_shift_mean",
+            "candidate_response_applied_shift_mean",
+            "candidate_response_noop_ratio",
+            "candidate_response_rollback_ratio",
+            "candidate_response_agent_opportunity_ratio",
+            "candidate_response_agent_requested_ratio",
+            "candidate_response_agent_effective_ratio",
+            "candidate_response_actuator_beta_mean",
+            "candidate_response_actuator_beta_min",
+            "candidate_response_actuator_beta_max",
+            "candidate_response_shadow_base_report_f",
+            "candidate_response_shadow_candidate_report_f",
+            "candidate_response_shadow_report_win",
+            "candidate_response_shadow_report_log_improve",
+            "committee_acceptance_ratio_early",
+            "committee_acceptance_ratio_mid",
+            "committee_acceptance_ratio_late",
+            "collab_mode_idx_mean",
+            "guide_scale_idx_mean",
+            "guide_scale_value_mean",
+            "collab_leader_active_ratio",
+            "collab_strength_multiplier_mean",
             "graph_comm_rounds",
             "comm_rounds_per_event",
             "comm_force_rounds",
@@ -186,6 +401,8 @@ class MAPPORunner:
             "last_actual_fes_mean",
             "last_actual_fes_max",
             "cumulative_actual_fes_mean",
+            "cmaes_numeric_fail_soft_step_count",
+            "cmaes_numeric_fail_soft_events",
             "last_consensus_shift_norm_mean",
             "last_consensus_shift_norm_max",
             "ccsa_lite_rounds",
@@ -198,20 +415,57 @@ class MAPPORunner:
             "graph_messages",
             "graph_transmitted_floats",
             "graph_transmitted_bytes",
+            "candidate_response_events",
+            "candidate_response_actuated_events",
+            "candidate_response_probe_local_evals",
+            "candidate_response_verification_local_evals",
+            "candidate_response_shadow_global_local_evals",
+            "candidate_response_rounds",
+            "candidate_response_messages",
+            "candidate_response_transmitted_floats",
+            "candidate_response_transmitted_bytes",
             "local_search_fes",
+            "candidate_validation_local_evals",
             "agent_state_local_evals",
             "global_monitor_local_evals",
             "global_monitor_rounds",
+            "verification_local_evals",
+            "total_physical_local_calls",
+            "reported_sum_fes",
+            "state_comm_rounds",
+            "state_comm_messages",
+            "state_comm_transmitted_floats",
+            "state_comm_transmitted_bytes",
+            "rollout_actual_local_search_fes",
+            "rollout_reported_fes",
+            "rollout_total_physical_local_calls",
+            "completed_episodes_per_rollout",
+            "env_resets_per_rollout",
+            "truncated_env_count",
+            "meta_steps_per_episode",
         ]
         tail = [
             "opt_max_ratio",
             "cfg_max_ratio",
             "res_max_ratio",
             "comm_max_ratio",
+            "collab_max_ratio",
+            "guide_scale_max_ratio",
+            "actuator_max_ratio",
             "actor_grad_norm",
             "critic_grad_norm",
         ]
-        return base + self.opt_ratio_keys + self.cfg_ratio_keys + self.res_ratio_keys + self.comm_ratio_keys + tail
+        return (
+            base
+            + self.opt_ratio_keys
+            + self.cfg_ratio_keys
+            + self.res_ratio_keys
+            + self.comm_ratio_keys
+            + self.collab_ratio_keys
+            + self.guide_scale_ratio_keys
+            + self.actuator_ratio_keys
+            + tail
+        )
 
     def _ensure_stats_header(self):
         if os.path.exists(self.stats_path):
@@ -257,9 +511,17 @@ class MAPPORunner:
         if (not self.forced_optimizer_enable) or self.opt_action_dim <= 0:
             return False, -1, False
 
-        local_epoch = int(max(0, epoch_i - self.start_epoch))
-        warmup_epochs = int(math.floor(float(self.train_epochs) * self.forced_optimizer_warmup_ratio + 1e-9))
-        warmup_epochs = int(max(0, min(self.train_epochs, warmup_epochs)))
+        local_epoch = int(max(0, epoch_i - self.schedule_start_epoch))
+        warmup_epochs = int(
+            math.floor(
+                float(self.schedule_train_epochs)
+                * self.forced_optimizer_warmup_ratio
+                + 1e-9
+            )
+        )
+        warmup_epochs = int(
+            max(0, min(self.schedule_train_epochs, warmup_epochs))
+        )
         in_warmup = local_epoch < warmup_epochs
 
         rng = np.random.default_rng(int(self.opts.seed + 1000003 + epoch_i))
@@ -505,6 +767,7 @@ class MAPPORunner:
         batches_per_epoch = int(math.ceil(float(n) / float(m)))
         total_batches = int(self.train_epochs * batches_per_epoch)
         pbar = tqdm(total=total_batches, disable=bool(self.opts.no_progress_bar), desc="mappo-train")
+        progress_every = max(0, int(os.environ.get("MAPPO_ACCEPT_PROGRESS_EVERY", "0")))
 
         for epoch_i in range(self.start_epoch, self.end_epoch):
             # per-epoch shuffle of train set
@@ -520,6 +783,12 @@ class MAPPORunner:
                 l = bidx * m
                 r = min((bidx + 1) * m, n)
                 batch_fun_ids = shuffled[l:r]
+                if progress_every:
+                    print(
+                        f"[accept-progress] epoch={epoch_i} batch={bidx + 1}/{batches_per_epoch} "
+                        f"rollout=0/{self.horizon} functions={batch_fun_ids} phase=batch_start",
+                        flush=True,
+                    )
                 envs = self._make_envs(batch_fun_ids=batch_fun_ids)
 
                 obs = envs.reset()  # [E,A,F]
@@ -553,6 +822,97 @@ class MAPPORunner:
                     "ccsa_scale_std": [],
                     "masoie_velocity_norm_mean": [],
                     "masoie_neighbor_pull_norm_mean": [],
+                    "optimizer_guide_norm_mean": [],
+                    "optimizer_guide_norm_max": [],
+                    "optimizer_guide_applied_ratio": [],
+                    "optimizer_guide_alignment_mean": [],
+                    "optimizer_guide_source_active_ratio": [],
+                    "optimizer_guide_strength_effective": [],
+                    "optimizer_guide_strength_scale": [],
+                    "optimizer_guide_schedule_metric": [],
+                    "optimizer_guide_internal_active_ratio": [],
+                    "optimizer_guide_internal_mean_step_norm_mean": [],
+                    "optimizer_guide_internal_mean_step_norm_max": [],
+                    "optimizer_guide_internal_alignment_mean": [],
+                    "anchor_enabled": [],
+                    "anchor_applied_ratio": [],
+                    "anchor_dist_mean": [],
+                    "anchor_dist_max": [],
+                    "anchor_direction_norm_mean": [],
+                    "anchor_direction_norm_max": [],
+                    "optimizer_anchor_applied_ratio": [],
+                    "optimizer_anchor_mean_step_norm_mean": [],
+                    "optimizer_anchor_mean_step_norm_max": [],
+                    "optimizer_anchor_sample_applied_ratio": [],
+                    "committee_supported": [],
+                    "committee_active": [],
+                    "committee_selection_target_block": [],
+                    "committee_best_score_mean": [],
+                    "committee_best_score_max": [],
+                    "committee_confidence_mean": [],
+                    "committee_confidence_max": [],
+                    "committee_guide_norm_mean": [],
+                    "committee_guide_norm_max": [],
+                    "committee_self_source_ratio": [],
+                    "committee_source_diversity_mean": [],
+                    "committee_source_diversity_max": [],
+                    "committee_shadow_whole_report_f": [],
+                    "committee_shadow_target_block_report_f": [],
+                    "committee_shadow_whole_report_win": [],
+                    "committee_shadow_target_block_report_win": [],
+                    "committee_shadow_whole_report_log_improve": [],
+                    "committee_shadow_target_block_report_log_improve": [],
+                    "committee_shadow_whole_agent_f_mean": [],
+                    "committee_shadow_whole_agent_f_min": [],
+                    "committee_shadow_target_block_agent_f_mean": [],
+                    "committee_shadow_target_block_agent_f_min": [],
+                    "committee_shadow_whole_agent_win_ratio": [],
+                    "committee_shadow_target_block_agent_win_ratio": [],
+                    "committee_shadow_target_block_win_vs_whole": [],
+                    "committee_acceptance_supported": [],
+                    "committee_acceptance_ratio": [],
+                    "committee_rejected_ratio": [],
+                    "committee_candidate_report_f": [],
+                    "committee_candidate_global_f_mean": [],
+                    "committee_candidate_global_f_min": [],
+                    "committee_candidate_vs_report_log_improve": [],
+                    "committee_effective_beta_mean": [],
+                    "committee_effective_beta_max": [],
+                    "committee_base_alignment_mean": [],
+                    "committee_noop_ratio": [],
+                    "candidate_response_supported": [],
+                    "candidate_response_active": [],
+                    "candidate_response_actuated": [],
+                    "candidate_response_probe_active_ratio": [],
+                    "candidate_response_generator_active_ratio": [],
+                    "candidate_response_accept_ratio": [],
+                    "candidate_response_selection_confidence_mean": [],
+                    "candidate_response_support_mean": [],
+                    "candidate_response_confidence_mean": [],
+                    "candidate_response_trust_radius_mean": [],
+                    "candidate_response_probe_radius_mean": [],
+                    "candidate_response_requested_shift_mean": [],
+                    "candidate_response_applied_shift_mean": [],
+                    "candidate_response_noop_ratio": [],
+                    "candidate_response_rollback_ratio": [],
+                    "candidate_response_agent_opportunity_ratio": [],
+                    "candidate_response_agent_requested_ratio": [],
+                    "candidate_response_agent_effective_ratio": [],
+                    "candidate_response_actuator_beta_mean": [],
+                    "candidate_response_actuator_beta_min": [],
+                    "candidate_response_actuator_beta_max": [],
+                    "candidate_response_shadow_base_report_f": [],
+                    "candidate_response_shadow_candidate_report_f": [],
+                    "candidate_response_shadow_report_win": [],
+                    "candidate_response_shadow_report_log_improve": [],
+                    "committee_acceptance_ratio_early": [],
+                    "committee_acceptance_ratio_mid": [],
+                    "committee_acceptance_ratio_late": [],
+                    "collab_mode_idx_mean": [],
+                    "guide_scale_idx_mean": [],
+                    "guide_scale_value_mean": [],
+                    "collab_leader_active_ratio": [],
+                    "collab_strength_multiplier_mean": [],
                     "comm_rounds_per_event": [],
                     "comm_force_rounds": [],
                     "last_comm_rounds_applied": [],
@@ -564,6 +924,8 @@ class MAPPORunner:
                     "last_actual_fes_mean": [],
                     "last_actual_fes_max": [],
                     "cumulative_actual_fes_mean": [],
+                    "cmaes_numeric_fail_soft_step_count": [],
+                    "cmaes_numeric_fail_soft_events": [],
                     "last_consensus_shift_norm_mean": [],
                     "last_consensus_shift_norm_max": [],
                     "step_comm_rounds_applied": [],
@@ -579,15 +941,57 @@ class MAPPORunner:
                     "graph_messages",
                     "graph_transmitted_floats",
                     "graph_transmitted_bytes",
+                    "committee_events",
+                    "committee_decision_local_evals",
+                    "committee_shadow_local_evals",
+                    "committee_shadow_global_local_evals",
+                    "committee_messages",
+                    "committee_transmitted_floats",
+                    "committee_transmitted_bytes",
+                    "committee_acceptance_events",
+                    "committee_acceptance_accepted_events",
+                    "committee_acceptance_rejected_events",
+                    "committee_acceptance_local_evals",
+                    "committee_acceptance_messages",
+                    "committee_acceptance_transmitted_floats",
+                    "committee_acceptance_transmitted_bytes",
+                    "committee_acceptance_early_events",
+                    "committee_acceptance_mid_events",
+                    "committee_acceptance_late_events",
+                    "committee_acceptance_early_accepted_events",
+                    "committee_acceptance_mid_accepted_events",
+                    "committee_acceptance_late_accepted_events",
+                    "candidate_response_events",
+                    "candidate_response_actuated_events",
+                    "candidate_response_probe_local_evals",
+                    "candidate_response_verification_local_evals",
+                    "candidate_response_shadow_global_local_evals",
+                    "candidate_response_rounds",
+                    "candidate_response_messages",
+                    "candidate_response_transmitted_floats",
+                    "candidate_response_transmitted_bytes",
                     "local_search_fes",
+                    "candidate_validation_local_evals",
                     "agent_state_local_evals",
                     "global_monitor_local_evals",
                     "global_monitor_rounds",
+                    "verification_local_evals",
+                    "total_physical_local_calls",
+                    "reported_sum_fes",
+                    "state_comm_rounds",
+                    "state_comm_messages",
+                    "state_comm_transmitted_floats",
+                    "state_comm_transmitted_bytes",
+                    "cmaes_numeric_fail_soft_events",
                 )
                 graph_cumulative_prev = None
                 graph_cumulative_totals = None
+                rollout_completed_episodes = 0
+                rollout_env_resets = 0
+                rollout_episode_lengths = []
+                rollout_steps_since_reset = None
 
-                for _ in range(self.horizon):
+                for rollout_step in range(self.horizon):
                     global_obs = obs.reshape(obs.shape[0], -1)  # [E, A*F]
                     with torch.no_grad():
                         forced_idx = forced_opt_idx if forced_active else None
@@ -595,11 +999,22 @@ class MAPPORunner:
                             obs,
                             return_parts=True,
                             forced_opt_idx=forced_idx,
+                            forced_actuator_idx=(
+                                self.forced_actuator_idx
+                                if self.forced_actuator_idx >= 0
+                                else None
+                            ),
                         )
                         values = self.policy.get_values_detailed(global_obs, actions)
 
                     actions_np = actions.detach().cpu().numpy()
                     next_obs, rewards, dones, infos = envs.step(actions_np)
+                    if progress_every and ((rollout_step + 1) % progress_every == 0):
+                        print(
+                            f"[accept-progress] epoch={epoch_i} batch={bidx + 1}/{batches_per_epoch} "
+                            f"rollout={rollout_step + 1}/{self.horizon} functions={batch_fun_ids}",
+                            flush=True,
+                        )
                     done_ids = np.where(np.asarray(dones).astype(bool))[0]
                     if done_ids.size > 0:
                         # BaseVectorEnv requires caller-side reset after done.
@@ -610,6 +1025,20 @@ class MAPPORunner:
                     if rewards_np.ndim != 2:
                         rewards_np = rewards_np.reshape(rewards_np.shape[0], -1)
                     e_num, a_num = rewards_np.shape
+                    if rollout_steps_since_reset is None:
+                        rollout_steps_since_reset = np.zeros(
+                            (e_num,),
+                            dtype=np.int64,
+                        )
+                    rollout_steps_since_reset += 1
+                    if done_ids.size > 0:
+                        rollout_completed_episodes += int(done_ids.size)
+                        rollout_env_resets += int(done_ids.size)
+                        rollout_episode_lengths.extend(
+                            int(rollout_steps_since_reset[int(env_id)])
+                            for env_id in done_ids
+                        )
+                        rollout_steps_since_reset[done_ids] = 0
                     if graph_cumulative_prev is None:
                         graph_cumulative_prev = {
                             name: np.zeros((e_num,), dtype=np.float64)
@@ -668,6 +1097,13 @@ class MAPPORunner:
                     local_centered_step_means.append(float(local_centered_t.mean().item()))
                     local_centered_step_stds.append(float(local_centered_t.std(unbiased=False).item()))
 
+                    log_probs_comm = act_parts.get(
+                        "logp_comm",
+                        torch.zeros_like(act_parts["logp_res"]),
+                    )
+                    if self.legacy_comm_old_logp_zero:
+                        log_probs_comm = torch.zeros_like(log_probs_comm)
+
                     buffer.add(
                         obs,
                         global_obs,
@@ -680,10 +1116,16 @@ class MAPPORunner:
                         values_res=values["value_res"],
                         values_ref=values["value_ref"],
                         values_comm=values.get("value_comm", torch.zeros_like(values["value_res"])),
+                        values_collab=values.get("value_collab", torch.zeros_like(values["value_res"])),
+                        values_guide_scale=values.get("value_guide_scale", torch.zeros_like(values["value_res"])),
+                        values_actuator=values.get("value_actuator", torch.zeros_like(values["value_res"])),
                         log_probs_opt=act_parts["logp_opt"],
                         log_probs_cfg=act_parts["logp_cfg"],
                         log_probs_res=act_parts["logp_res"],
-                        log_probs_comm=act_parts.get("logp_comm", torch.zeros_like(act_parts["logp_res"])),
+                        log_probs_comm=log_probs_comm,
+                        log_probs_collab=act_parts.get("logp_collab", torch.zeros_like(act_parts["logp_res"])),
+                        log_probs_guide_scale=act_parts.get("logp_guide_scale", torch.zeros_like(act_parts["logp_res"])),
+                        log_probs_actuator=act_parts.get("logp_actuator", torch.zeros_like(act_parts["logp_res"])),
                     )
 
                     obs = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
@@ -692,7 +1134,15 @@ class MAPPORunner:
                 with torch.no_grad():
                     next_global_obs = obs.reshape(obs.shape[0], -1)
                     next_forced_idx = forced_opt_idx if forced_active else None
-                    next_actions, _, _ = self.policy.act(obs, forced_opt_idx=next_forced_idx)
+                    next_actions, _, _ = self.policy.act(
+                        obs,
+                        forced_opt_idx=next_forced_idx,
+                        forced_actuator_idx=(
+                            self.forced_actuator_idx
+                            if self.forced_actuator_idx >= 0
+                            else None
+                        ),
+                    )
                     next_values = self.policy.get_values_detailed(next_global_obs, next_actions)
 
                 buffer.compute_returns_advantages(
@@ -754,6 +1204,29 @@ class MAPPORunner:
                         else np.zeros((1,), dtype=np.float64)
                     )
                     stats[metric_name] = float(np.mean(totals))
+                stats["rollout_actual_local_search_fes"] = float(
+                    stats.get("local_search_fes", 0.0)
+                )
+                stats["rollout_reported_fes"] = float(
+                    stats.get("reported_sum_fes", 0.0)
+                )
+                stats["rollout_total_physical_local_calls"] = float(
+                    stats.get("total_physical_local_calls", 0.0)
+                )
+                stats["completed_episodes_per_rollout"] = float(
+                    rollout_completed_episodes
+                )
+                stats["env_resets_per_rollout"] = float(rollout_env_resets)
+                stats["truncated_env_count"] = float(
+                    np.count_nonzero(rollout_steps_since_reset)
+                    if rollout_steps_since_reset is not None
+                    else 0
+                )
+                stats["meta_steps_per_episode"] = float(
+                    np.mean(rollout_episode_lengths)
+                    if rollout_episode_lengths
+                    else 0.0
+                )
                 with torch.no_grad():
                     adv_opt = batch["adv_opt_all"]
                     adv_cfg = batch["adv_cfg_all"]
@@ -765,10 +1238,19 @@ class MAPPORunner:
                     values_cfg = batch["values_cfg_all"]
                     values_res = batch["values_res_all"]
                     values_comm = batch["values_comm_all"]
+                    values_collab = batch["values_collab_all"]
+                    values_guide_scale = batch["values_guide_scale_all"]
+                    values_actuator = batch["values_actuator_all"]
+                    value_parts = [values_ref, values_opt, values_cfg, values_res]
                     if self.comm_action_enable:
-                        values_mean = (values_ref + values_opt + values_cfg + values_res + values_comm) / 5.0
-                    else:
-                        values_mean = (values_ref + values_opt + values_cfg + values_res) / 4.0
+                        value_parts.append(values_comm)
+                    if self.collab_action_enable:
+                        value_parts.append(values_collab)
+                    if self.guide_scale_action_enable:
+                        value_parts.append(values_guide_scale)
+                    if self.actuator_action_enable:
+                        value_parts.append(values_actuator)
+                    values_mean = sum(value_parts) / float(len(value_parts))
                     if self.mappo_log_adv_stats and (adv_res is not None):
                         stats["adv_opt_mean"] = float(adv_opt.mean().item())
                         stats["adv_opt_std"] = float(adv_opt.std(unbiased=False).item())
@@ -778,10 +1260,25 @@ class MAPPORunner:
                         stats["adv_res_std"] = float(adv_res.std(unbiased=False).item())
                         stats["adv_comm_mean"] = float(adv_comm.mean().item()) if self.comm_action_enable else 0.0
                         stats["adv_comm_std"] = float(adv_comm.std(unbiased=False).item()) if self.comm_action_enable else 0.0
+                        adv_collab = batch["adv_collab_all"]
+                        adv_guide_scale = batch["adv_guide_scale_all"]
+                        adv_actuator = batch["adv_actuator_all"]
+                        stats["adv_collab_mean"] = float(adv_collab.mean().item()) if self.collab_action_enable else 0.0
+                        stats["adv_collab_std"] = float(adv_collab.std(unbiased=False).item()) if self.collab_action_enable else 0.0
+                        stats["adv_guide_scale_mean"] = float(adv_guide_scale.mean().item()) if self.guide_scale_action_enable else 0.0
+                        stats["adv_guide_scale_std"] = float(adv_guide_scale.std(unbiased=False).item()) if self.guide_scale_action_enable else 0.0
+                        stats["adv_actuator_mean"] = float(adv_actuator.mean().item()) if self.actuator_action_enable else 0.0
+                        stats["adv_actuator_std"] = float(adv_actuator.std(unbiased=False).item()) if self.actuator_action_enable else 0.0
+                        adv_head_parts = [adv_opt, adv_cfg, adv_res]
                         if self.comm_action_enable:
-                            adv_all_heads = (adv_opt + adv_cfg + adv_res + adv_comm) / 4.0
-                        else:
-                            adv_all_heads = (adv_opt + adv_cfg + adv_res) / 3.0
+                            adv_head_parts.append(adv_comm)
+                        if self.collab_action_enable:
+                            adv_head_parts.append(adv_collab)
+                        if self.guide_scale_action_enable:
+                            adv_head_parts.append(adv_guide_scale)
+                        if self.actuator_action_enable:
+                            adv_head_parts.append(adv_actuator)
+                        adv_all_heads = sum(adv_head_parts) / float(len(adv_head_parts))
                         stats["adv_mean"] = float(adv_all_heads.mean().item())
                         stats["adv_std"] = float(adv_all_heads.std(unbiased=False).item())
                         # Across-agent imbalance metrics.
@@ -806,6 +1303,12 @@ class MAPPORunner:
                         stats["adv_res_std"] = 0.0
                         stats["adv_comm_mean"] = 0.0
                         stats["adv_comm_std"] = 0.0
+                        stats["adv_collab_mean"] = 0.0
+                        stats["adv_collab_std"] = 0.0
+                        stats["adv_guide_scale_mean"] = 0.0
+                        stats["adv_guide_scale_std"] = 0.0
+                        stats["adv_actuator_mean"] = 0.0
+                        stats["adv_actuator_std"] = 0.0
                         stats["adv_mean"] = 0.0
                         stats["adv_std"] = 0.0
                         stats["adv_agent_mean_std"] = 0.0
@@ -850,7 +1353,8 @@ class MAPPORunner:
                     for i in range(self.res_action_dim):
                         stats[f"res_ratio_{i}"] = float(ratios_res[i])
                     if self.comm_action_enable:
-                        comm_flat = actions_all[..., 2 + self.cfg_param_num].reshape(-1)
+                        comm_col = 2 + self.cfg_param_num
+                        comm_flat = actions_all[..., comm_col].reshape(-1)
                         denom_comm = max(1, comm_flat.size)
                         counts_comm = np.bincount(comm_flat, minlength=self.comm_action_dim).astype(np.float64)
                         ratios_comm = counts_comm / float(denom_comm)
@@ -859,6 +1363,50 @@ class MAPPORunner:
                         stats["comm_max_ratio"] = float(np.max(ratios_comm)) if ratios_comm.size > 0 else 0.0
                     else:
                         stats["comm_max_ratio"] = 0.0
+                    collab_col = 2 + self.cfg_param_num + (1 if self.comm_action_enable else 0)
+                    if self.collab_action_enable:
+                        collab_flat = actions_all[..., collab_col].reshape(-1)
+                        denom_collab = max(1, collab_flat.size)
+                        counts_collab = np.bincount(collab_flat, minlength=self.collab_action_dim).astype(np.float64)
+                        ratios_collab = counts_collab / float(denom_collab)
+                        for i in range(self.collab_action_dim):
+                            stats[f"collab_ratio_{i}"] = float(ratios_collab[i])
+                        stats["collab_max_ratio"] = float(np.max(ratios_collab)) if ratios_collab.size > 0 else 0.0
+                    else:
+                        stats["collab_max_ratio"] = 0.0
+                    guide_scale_col = collab_col + (1 if self.collab_action_enable else 0)
+                    if self.guide_scale_action_enable:
+                        guide_flat = actions_all[..., guide_scale_col].reshape(-1)
+                        denom_guide = max(1, guide_flat.size)
+                        counts_guide = np.bincount(guide_flat, minlength=self.guide_scale_action_dim).astype(np.float64)
+                        ratios_guide = counts_guide / float(denom_guide)
+                        for i in range(self.guide_scale_action_dim):
+                            stats[f"guide_scale_ratio_{i}"] = float(ratios_guide[i])
+                        stats["guide_scale_max_ratio"] = float(np.max(ratios_guide)) if ratios_guide.size > 0 else 0.0
+                    else:
+                        stats["guide_scale_max_ratio"] = 0.0
+                    actuator_col = guide_scale_col + (
+                        1 if self.guide_scale_action_enable else 0
+                    )
+                    if self.actuator_action_enable:
+                        actuator_flat = actions_all[..., actuator_col].reshape(-1)
+                        denom_actuator = max(1, actuator_flat.size)
+                        counts_actuator = np.bincount(
+                            actuator_flat,
+                            minlength=self.actuator_action_dim,
+                        ).astype(np.float64)
+                        ratios_actuator = counts_actuator / float(denom_actuator)
+                        for i in range(self.actuator_action_dim):
+                            stats[f"actuator_ratio_{i}"] = float(
+                                ratios_actuator[i]
+                            )
+                        stats["actuator_max_ratio"] = (
+                            float(np.max(ratios_actuator))
+                            if ratios_actuator.size > 0
+                            else 0.0
+                        )
+                    else:
+                        stats["actuator_max_ratio"] = 0.0
                     stats["opt_max_ratio"] = float(np.max(ratios_opt)) if ratios_opt.size > 0 else 0.0
                     stats["cfg_max_ratio"] = float(cfg_max_ratio)
                     stats["res_max_ratio"] = float(np.max(ratios_res)) if ratios_res.size > 0 else 0.0
@@ -873,10 +1421,19 @@ class MAPPORunner:
                         stats[f"res_ratio_{i}"] = 0.0
                     for i in range(self.comm_action_dim if self.comm_action_enable else 0):
                         stats[f"comm_ratio_{i}"] = 0.0
+                    for i in range(self.collab_action_dim if self.collab_action_enable else 0):
+                        stats[f"collab_ratio_{i}"] = 0.0
+                    for i in range(self.guide_scale_action_dim if self.guide_scale_action_enable else 0):
+                        stats[f"guide_scale_ratio_{i}"] = 0.0
+                    for i in range(self.actuator_action_dim if self.actuator_action_enable else 0):
+                        stats[f"actuator_ratio_{i}"] = 0.0
                     stats["opt_max_ratio"] = 0.0
                     stats["cfg_max_ratio"] = 0.0
                     stats["res_max_ratio"] = 0.0
                     stats["comm_max_ratio"] = 0.0
+                    stats["collab_max_ratio"] = 0.0
+                    stats["guide_scale_max_ratio"] = 0.0
+                    stats["actuator_max_ratio"] = 0.0
 
                 self._append_stats(epoch_i, stats)
                 history_stats.append({k: float(v) for k, v in stats.items() if isinstance(v, (int, float, np.floating))})
@@ -905,6 +1462,7 @@ class MAPPORunner:
             # simple periodic checkpoint (per epoch)
             if (last_stats is not None) and self.saving_enabled and ((epoch_i + 1) % int(max(1, self.opts.checkpoint_epochs)) == 0):
                 ckpt = {
+                    "checkpoint_version": 2,
                     "actor": self.policy.actor.state_dict(),
                     "critic": self.policy.critic.state_dict(),
                     "actor_opt": self.policy.actor_optimizer.state_dict(),
@@ -913,6 +1471,12 @@ class MAPPORunner:
                     "policy_signature_str": getattr(self.policy, "policy_signature_str", ""),
                     "epoch": int(epoch_i),
                     "stats": last_stats,
+                    "rng_state_version": MAPPO_RNG_STATE_VERSION,
+                    "rng_state": capture_rng_state(),
+                    "training_schedule": {
+                        "start_epoch": int(self.schedule_start_epoch),
+                        "end_epoch": int(self.schedule_end_epoch),
+                    },
                 }
                 torch.save(ckpt, os.path.join(self.opts.modal_save_dir, f"mappo-epoch-{epoch_i}.pt"))
                 epoch_reward = float(np.mean(epoch_reward_means)) if len(epoch_reward_means) > 0 else -float("inf")

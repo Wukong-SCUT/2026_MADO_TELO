@@ -63,14 +63,44 @@ class MASOIEWSNFunction:
                 self.measurements[i, t] = dist2 + noise
 
     def _local_eval_batch(self, agent_id: int, x_batch: np.ndarray) -> np.ndarray:
-        x_batch = np.asarray(x_batch, dtype=np.float64).reshape(-1, self.target_num, 3)
-        sensor = self.sensor_pos[int(agent_id)]  # [3]
-        phi = self.measurements[int(agent_id)]  # [Nt]
+        residuals = self.local_target_residual_batch(agent_id, x_batch)
+        return np.sum(residuals, axis=1).astype(np.float64, copy=False)
+
+    def local_target_residual_batch(
+        self,
+        agent_id: int,
+        x_batch: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Return per-target squared distance-measurement residuals.
+
+        Shape:
+          x_batch: [N,D] or [D]
+          return:  [N,target_num]
+        """
+        aid = int(agent_id)
+        if aid < 0 or aid >= self.node_num:
+            raise ValueError(f"agent_id out of range: {aid}, node_num={self.node_num}")
+        x = np.asarray(x_batch, dtype=np.float64)
+        if x.ndim == 1:
+            x = x[None, :]
+        if x.ndim != 2:
+            raise ValueError(
+                f"local_target_residual_batch expected [N,D] or [D], got {x.shape}"
+            )
+        if x.shape[1] != self.dimension:
+            raise ValueError(
+                "local_target_residual_batch dimension mismatch: "
+                f"expected {self.dimension}, got {x.shape[1]}"
+            )
+        x = x.reshape(-1, self.target_num, 3)
+        sensor = self.sensor_pos[aid]  # [3]
+        phi = self.measurements[aid]  # [Nt]
 
         # est_dist2: [N, Nt]
-        est_dist2 = np.sum((x_batch - sensor[None, None, :]) ** 2, axis=2)
+        est_dist2 = np.sum((x - sensor[None, None, :]) ** 2, axis=2)
         err = phi[None, :] - est_dist2
-        return np.sum(err ** 2, axis=1).astype(np.float64, copy=False)
+        return (err ** 2).astype(np.float64, copy=False)
 
     def local_eval_batch(self, agent_id: int, x_batch: np.ndarray) -> np.ndarray:
         """
@@ -141,66 +171,3 @@ class MASOIEWSNFunction:
             "has_W": True,
             "w_source": self.w_source,
         }
-
-
-class Benchmark:
-    """
-    MASOIE-style WSN benchmark manager, aligned with CEC interface.
-    """
-
-    def __init__(self, opts=None):
-        self.opts = opts
-        self._func_cache: Dict[int, MASOIEWSNFunction] = {}
-
-        target_num_list = [5]
-        if opts is not None and getattr(opts, "masoie_wsn_target_num_list", None):
-            target_num_list = [int(x) for x in getattr(opts, "masoie_wsn_target_num_list")]
-
-        self.problem_specs: Dict[int, Dict] = {}
-        for i, t in enumerate(target_num_list, start=1):
-            self.problem_specs[i] = {
-                "target_num": int(t),
-                "node_num": int(getattr(opts, "masoie_wsn_node_num", 20)) if opts is not None else 20,
-                "space_size": float(getattr(opts, "masoie_wsn_space_size", 100.0)) if opts is not None else 100.0,
-                "noise_std": float(getattr(opts, "masoie_wsn_noise_std", 2.0)) if opts is not None else 2.0,
-            }
-
-    def _build_seed(self, func_id: int) -> int:
-        base = int(getattr(self.opts, "seed", 42)) if self.opts is not None else 42
-        return int(base + 13013 * int(func_id))
-
-    def _build_function(self, func_id: int) -> MASOIEWSNFunction:
-        fid = int(func_id)
-        if fid not in self.problem_specs:
-            raise ValueError(
-                f"MASOIE WSN function id {func_id} is out of range. "
-                f"Available ids: {sorted(self.problem_specs.keys())}"
-            )
-        spec = self.problem_specs[fid]
-        return MASOIEWSNFunction(
-            node_num=spec["node_num"],
-            target_num=spec["target_num"],
-            space_size=spec["space_size"],
-            noise_std=spec["noise_std"],
-            seed=self._build_seed(fid),
-        )
-
-    def get_function(self, func_id: int) -> MASOIEWSNFunction:
-        fid = int(func_id)
-        if fid not in self._func_cache:
-            self._func_cache[fid] = self._build_function(fid)
-        return self._func_cache[fid]
-
-    def get_info(self, func_id: int) -> Dict:
-        return self.get_function(func_id).info()
-
-    def get_num_functions(self) -> int:
-        return int(len(self.problem_specs))
-
-    def get_function_names(self) -> List[str]:
-        out = []
-        for fid in sorted(self.problem_specs.keys()):
-            t = self.problem_specs[fid]["target_num"]
-            n = self.problem_specs[fid]["node_num"]
-            out.append(f"MASOIE_WSN_3d_{n}s_{t}t")
-        return out

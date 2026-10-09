@@ -3,7 +3,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from benchmarks.cdo_f1f15.math_functions import (
+from benchmark._cdo_shared.math_functions import (
     FUNC_MAP_VEC,
     _get_elliptic_w,
     _griewank_vec,

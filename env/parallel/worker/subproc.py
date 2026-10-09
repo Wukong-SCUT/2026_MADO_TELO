@@ -1,4 +1,8 @@
 import ctypes
+import faulthandler
+import os
+import signal
+import sys
 import time
 from collections import OrderedDict
 from multiprocessing import Array, Pipe, connection
@@ -64,6 +68,11 @@ def _worker(
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
 ) -> None:
+    if str(os.environ.get("MAPPO_NATIVE_CRASH_DIAGNOSTICS", "0")).strip() == "1":
+        try:
+            faulthandler.enable(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
 
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
@@ -99,6 +108,18 @@ def _worker(
                     p.send(obs)
                 else:
                     p.send((obs, reward, done, info))
+            elif cmd == "prepare_step":
+                p.send(env.prepare_step(data))
+            elif cmd == "prepare_generator_step":
+                p.send(env.prepare_generator_step(data))
+            elif cmd == "prepare_actuator_step":
+                p.send(env.prepare_actuator_step(data))
+            elif cmd == "commit_step":
+                obs, reward, done, info = env.commit_step(data)
+                if obs_bufs is not None:
+                    _encode_obs(obs, obs_bufs)
+                    obs = None
+                p.send((obs, reward, done, info))
             elif cmd == "close":
                 p.send(env.close())
                 p.close()
@@ -196,7 +217,24 @@ class SubprocEnvWorker(EnvWorker):
     def recv(
         self
     ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
-        result = self.parent_remote.recv()
+        try:
+            result = self.parent_remote.recv()
+        except EOFError as exc:
+            self.process.join(timeout=0.5)
+            exitcode = self.process.exitcode
+            signal_name = ""
+            if isinstance(exitcode, int) and exitcode < 0:
+                try:
+                    signal_name = signal.Signals(-exitcode).name
+                except ValueError:
+                    signal_name = f"signal_{-exitcode}"
+            detail = (
+                f"Environment worker exited before replying: "
+                f"pid={self.process.pid}, exitcode={exitcode}"
+            )
+            if signal_name:
+                detail += f", signal={signal_name}"
+            raise RuntimeError(detail) from exc
         if isinstance(result, tuple):
             obs, rew, done, info = result
             if self.share_memory:
@@ -213,6 +251,44 @@ class SubprocEnvWorker(EnvWorker):
         self.parent_remote.send(["seed", seed])
         return self.parent_remote.recv()
 
+    def prepare_step(self, action: np.ndarray):
+        self.parent_remote.send(["prepare_step", action])
+        return self.parent_remote.recv()
+
+    def prepare_generator_step(self, action: np.ndarray):
+        self.send_prepare_generator_step(action)
+        return self.recv_prepare_generator_step()
+
+    def send_prepare_generator_step(self, action: np.ndarray) -> None:
+        self.parent_remote.send(["prepare_generator_step", action])
+
+    def recv_prepare_generator_step(self):
+        return self.parent_remote.recv()
+
+    def prepare_actuator_step(self, action: np.ndarray):
+        self.send_prepare_actuator_step(action)
+        return self.recv_prepare_actuator_step()
+
+    def send_prepare_actuator_step(self, action: np.ndarray) -> None:
+        self.parent_remote.send(["prepare_actuator_step", action])
+
+    def recv_prepare_actuator_step(self):
+        return self.parent_remote.recv()
+
+    def commit_step(self, action: np.ndarray):
+        self.send_commit_step(action)
+        return self.recv_commit_step()
+
+    def send_commit_step(self, action: np.ndarray) -> None:
+        self.parent_remote.send(["commit_step", action])
+
+    def recv_commit_step(self):
+        result = self.parent_remote.recv()
+        obs, rew, done, info = result
+        if self.share_memory:
+            obs = self._decode_obs()
+        return obs, rew, done, info
+
     def render(self, **kwargs: Any) -> Any:
         self.parent_remote.send(["render", kwargs])
         return self.parent_remote.recv()
@@ -227,3 +303,21 @@ class SubprocEnvWorker(EnvWorker):
             pass
         # ensure the subproc is terminated
         self.process.terminate()
+
+    def abort_env(self) -> None:
+        """Force-stop a failed worker without waiting for its command loop."""
+        self.is_closed = True
+        for remote in (self.parent_remote, self.child_remote):
+            try:
+                remote.close()
+            except (OSError, AttributeError):
+                pass
+        try:
+            if self.process.is_alive():
+                self.process.terminate()
+            self.process.join(timeout=1.0)
+            if self.process.is_alive() and hasattr(self.process, "kill"):
+                self.process.kill()
+                self.process.join(timeout=1.0)
+        except (AssertionError, AttributeError, OSError):
+            pass

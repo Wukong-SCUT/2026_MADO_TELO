@@ -5,7 +5,7 @@ channels:
 dependencies:
   - python=3.11
   - pip
-  - numpy
+  - numpy>=2,<3
   - scipy
   - pandas
   - matplotlib
@@ -17,4 +17,5 @@ dependencies:
   - pytorch
   - tensorboard
   - pip:
+      - tensorboard-logger
       - opencv-python

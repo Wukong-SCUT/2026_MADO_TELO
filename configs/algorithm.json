@@ -1,0 +1,84 @@
+{
+  "name": "E3aj",
+  "model_checkpoint": "checkpoints/mappo-epoch-5.pt",
+  "training_seed": 58,
+  "epoch_start": 0,
+  "epoch_end": 6,
+  "schedule_start_epoch": 0,
+  "schedule_end_epoch": 23,
+  "optimizer_candidates": [
+    "mmes",
+    "vkd",
+    "cmaes",
+    "sepcmaes"
+  ],
+  "optimizer_profile_candidates": [
+    "inherit",
+    "numeric_inherit",
+    "conservative",
+    "balanced",
+    "aggressive"
+  ],
+  "resource_factors": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "communication_round_candidates": [
+    2,
+    4,
+    6,
+    8
+  ],
+  "fixed_agent_num": 20,
+  "fixed_subfes_per_agent": 250,
+  "mappo_action_arch": "current",
+  "objective_split_information_mode": "local_only",
+  "objective_split_state_comm_mode": "graph_mean",
+  "objective_split_comm_action_reduce": "mean_round",
+  "actor1_hidden_dim": 256,
+  "actor2_hidden_dim": 320,
+  "mappo_opt_emb_dim": 8,
+  "mappo_cfg_emb_dim": 8,
+  "mappo_cfg_param_num": 4,
+  "benchmark": "CDOBenchF1F15",
+  "training_function_ids": [
+    2,
+    5,
+    6,
+    8,
+    13,
+    15
+  ],
+  "mappo_env_mode": "cdo_objective",
+  "objective_split_consensus": "graph_mean",
+  "objective_split_ccsa_momentum_update_mode": "always",
+  "objective_split_state_comm_cost_mode": "independent",
+  "objective_split_event_slot_interleaving_enable": 1,
+  "objective_split_sigma_inherit_enable": 1,
+  "objective_split_sigma_validity_gate_enable": 0,
+  "objective_split_sigma_state_obs_enable": 0,
+  "objective_split_optimizer_guide_enable": 1,
+  "objective_split_optimizer_guide_apply_optimizers": [
+    "cmaes",
+    "sepcmaes"
+  ],
+  "objective_split_mmes_ratio_success_metric": "full",
+  "objective_split_cma_sep_ratio_path_strength": 0.1,
+  "objective_split_cmaes_numeric_fail_soft": 1,
+  "subopt_vkd_kmax_levels": [
+    4,
+    8,
+    32
+  ],
+  "subopt_sepcmaes_cov_lr_scale_levels": [
+    0.75,
+    1.5,
+    2.5
+  ],
+  "forced_optimizer_enable": 1,
+  "forced_optimizer_probability": 0.25,
+  "forced_optimizer_warmup_ratio": 0.2,
+  "mappo_update_mode": "split_env",
+  "evaluation_agent_mismatch_policy": "actor_only_for_WSN"
+}

@@ -59,6 +59,29 @@ class BaseVectorEnv(gym.Env):
         assert not self.is_closed, \
             f"Methods of {self.__class__.__name__} cannot be called after close."
 
+    def _abort_workers(self) -> None:
+        """Best-effort non-blocking cleanup after one worker fails."""
+        for worker in self.workers:
+            abort = getattr(worker, "abort_env", None)
+            try:
+                if callable(abort):
+                    abort()
+                else:
+                    worker.close()
+            except BaseException:
+                pass
+        self.waiting_conn.clear()
+        self.waiting_id.clear()
+        self.ready_id.clear()
+        self.is_closed = True
+
+    def _recv_or_abort(self, worker: EnvWorker):
+        try:
+            return worker.recv()
+        except BaseException:
+            self._abort_workers()
+            raise
+
     def __len__(self) -> int:
         """Return len(self), which is the number of environments."""
         return self.env_num
@@ -155,7 +178,7 @@ class BaseVectorEnv(gym.Env):
         # send(None) == reset() in worker
         for i in id:
             self.workers[i].send(None)
-        obs_list = [self.workers[i].recv() for i in id]
+        obs_list = [self._recv_or_abort(self.workers[i]) for i in id]
         try:
             obs = np.stack(obs_list)
         except ValueError:  # different len(obs)
@@ -205,7 +228,7 @@ class BaseVectorEnv(gym.Env):
                 self.workers[j].send(action[i])
             result = []
             for j in id:
-                obs, rew, done, info = self.workers[j].recv()
+                obs, rew, done, info = self._recv_or_abort(self.workers[j])
                 info["env_id"] = j
                 result.append((obs, rew, done, info))
         else:
@@ -227,7 +250,7 @@ class BaseVectorEnv(gym.Env):
                 waiting_index = self.waiting_conn.index(conn)
                 self.waiting_conn.pop(waiting_index)
                 env_id = self.waiting_id.pop(waiting_index)
-                obs, rew, done, info = conn.recv()
+                obs, rew, done, info = self._recv_or_abort(conn)
                 info["env_id"] = env_id
                 result.append((obs, rew, done, info))
                 self.ready_id.append(env_id)
@@ -240,6 +263,123 @@ class BaseVectorEnv(gym.Env):
             np.stack, [rew_list, done_list, info_list]
         )
         return self.normalize_obs(obs_stack), rew_stack, done_stack, info_stack
+
+    def prepare_step(
+        self,
+        action: np.ndarray,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ):
+        """Synchronously prepare verifier contracts for selected environments."""
+        self._assert_is_not_closed()
+        if self.is_async:
+            raise RuntimeError(
+                "Two-stage prepare_step currently supports synchronous "
+                "vector environments only."
+            )
+        id = self._wrap_id(id)
+        assert len(action) == len(id)
+        results = [
+            self.workers[env_id].prepare_step(action[pos])
+            for pos, env_id in enumerate(id)
+        ]
+        obs_list, mask_list, info_list = zip(*results)
+        return (
+            np.stack(obs_list),
+            np.stack(mask_list),
+            np.asarray(info_list, dtype=object),
+        )
+
+    def prepare_generator_step(
+        self,
+        action: np.ndarray,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ):
+        """Synchronously prepare D6 pre-generator contexts."""
+        self._assert_is_not_closed()
+        if self.is_async:
+            raise RuntimeError(
+                "D6 prepare_generator_step supports synchronous vector "
+                "environments only."
+            )
+        id = self._wrap_id(id)
+        assert len(action) == len(id)
+        for pos, env_id in enumerate(id):
+            self.workers[env_id].send_prepare_generator_step(action[pos])
+        results = [
+            self.workers[env_id].recv_prepare_generator_step()
+            for env_id in id
+        ]
+        obs_list, actor_mask_list, critic_mask_list, info_list = zip(*results)
+        return (
+            np.stack(obs_list),
+            np.stack(actor_mask_list),
+            np.stack(critic_mask_list),
+            np.asarray(info_list, dtype=object),
+        )
+
+    def prepare_actuator_step(
+        self,
+        action: np.ndarray,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ):
+        """Synchronously dispatch D6 generator actions."""
+        self._assert_is_not_closed()
+        if self.is_async:
+            raise RuntimeError(
+                "D6 prepare_actuator_step supports synchronous vector "
+                "environments only."
+            )
+        id = self._wrap_id(id)
+        assert len(action) == len(id)
+        for pos, env_id in enumerate(id):
+            self.workers[env_id].send_prepare_actuator_step(action[pos])
+        results = [
+            self.workers[env_id].recv_prepare_actuator_step()
+            for env_id in id
+        ]
+        obs_list, mask_list, info_list = zip(*results)
+        return (
+            np.stack(obs_list),
+            np.stack(mask_list),
+            np.asarray(info_list, dtype=object),
+        )
+
+    def commit_step(
+        self,
+        action: np.ndarray,
+        id: Optional[Union[int, List[int], np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Synchronously commit actuator actions for prepared environments."""
+        self._assert_is_not_closed()
+        if self.is_async:
+            raise RuntimeError(
+                "Two-stage commit_step currently supports synchronous "
+                "vector environments only."
+            )
+        id = self._wrap_id(id)
+        assert len(action) == len(id)
+        for pos, env_id in enumerate(id):
+            self.workers[env_id].send_commit_step(action[pos])
+        result = []
+        for env_id in id:
+            obs, rew, done, info = self.workers[env_id].recv_commit_step()
+            info["env_id"] = env_id
+            result.append((obs, rew, done, info))
+        obs_list, rew_list, done_list, info_list = zip(*result)
+        try:
+            obs_stack = np.stack(obs_list)
+        except ValueError:
+            obs_stack = np.array(obs_list, dtype=object)
+        rew_stack, done_stack, info_stack = map(
+            np.stack,
+            [rew_list, done_list, info_list],
+        )
+        return (
+            self.normalize_obs(obs_stack),
+            rew_stack,
+            done_stack,
+            info_stack,
+        )
 
     def seed(
         self,

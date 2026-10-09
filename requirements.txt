@@ -1,5 +1,5 @@
-# Runtime dependencies for the C8c CDOBench/WSN release.
-numpy
+﻿# Minimal runtime dependencies for MAPPO/CEC/WSN workflows
+numpy>=2,<3
 scipy
 pandas
 matplotlib
@@ -10,5 +10,5 @@ openpyxl
 cloudpickle
 torch
 tensorboard
+tensorboard-logger
 opencv-python
-

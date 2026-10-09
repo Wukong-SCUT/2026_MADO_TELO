@@ -1,15 +1,12 @@
-from pathlib import Path
 from typing import Dict
-
 import numpy as np
 
 
-def _read_matrix(path: Path):
+def _read_matrix(path):
     try:
         return np.loadtxt(str(path), dtype=np.float64)
-    except (OSError, ValueError):
+    except Exception:
         return None
-
 
 _ELLIPTIC_W_CACHE: Dict[int, np.ndarray] = {}
 _GRIEWANK_SQRT_IDX_CACHE: Dict[int, np.ndarray] = {}
@@ -58,19 +55,20 @@ def _t_asy_vec(z: np.ndarray, beta: float = 0.2) -> np.ndarray:
     expv = _get_asy_expv(d, beta)
     rows, cols = np.where(z > 0)
     with np.errstate(over="ignore", invalid="ignore"):
-        out[rows, cols] = z[rows, cols] ** (
-            1.0 + expv[cols] * np.sqrt(z[rows, cols])
-        )
+        out[rows, cols] = z[rows, cols] ** (1.0 + expv[cols] * np.sqrt(z[rows, cols]))
     return out
 
 
 def _elliptic_vec(z: np.ndarray) -> np.ndarray:
     z2 = _t_osz_vec(z)
-    return z2 ** 2 @ _get_elliptic_w(z2.shape[1])
+    d = z2.shape[1]
+    w = _get_elliptic_w(d)
+    return z2 ** 2 @ w
 
 
 def _schwefel_vec(z: np.ndarray) -> np.ndarray:
-    z2 = _t_asy_vec(_t_osz_vec(z), beta=0.2)
+    z2 = _t_osz_vec(z)
+    z2 = _t_asy_vec(z2, beta=0.2)
     with np.errstate(over="ignore", invalid="ignore"):
         return np.sum(np.cumsum(z2, axis=1) ** 2, axis=1)
 
@@ -78,11 +76,14 @@ def _schwefel_vec(z: np.ndarray) -> np.ndarray:
 def _rosenbrock_vec(z: np.ndarray) -> np.ndarray:
     z0 = z[:, :-1]
     z1 = z[:, 1:]
-    return np.sum(100.0 * (z0 * z0 - z1) ** 2 + (z0 - 1.0) ** 2, axis=1)
+    t1 = z0 * z0 - z1
+    t2 = z0 - 1.0
+    return np.sum(100.0 * t1 * t1 + t2 * t2, axis=1)
 
 
 def _griewank_vec(z: np.ndarray) -> np.ndarray:
-    sqrt_idx = _get_griewank_sqrt_idx(z.shape[1])
+    d = z.shape[1]
+    sqrt_idx = _get_griewank_sqrt_idx(d)
     return np.sum(z ** 2, axis=1) / 4000.0 - np.prod(np.cos(z / sqrt_idx), axis=1) + 1.0
 
 
@@ -92,3 +93,5 @@ FUNC_MAP_VEC = {
     "rosenbrock": _rosenbrock_vec,
     "griewank": _griewank_vec,
 }
+
+
