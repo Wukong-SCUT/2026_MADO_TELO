@@ -363,7 +363,7 @@ def get_options(args=None):
                         help='Fixed optimizer-guide strength alpha. For directional injection, candidates use mean +/- alpha*sigma*guide.')
     parser.add_argument('--objective_split_optimizer_guide_strength_schedule', type=str, default='fixed',
                         choices=['fixed', 'disagreement', 'budget'],
-                        help='Guide strength schedule. fixed keeps objective_split_optimizer_guide_strength; disagreement scales it by the previous post-consensus mean disagreement; budget anneals it linearly to zero over the first 50% of the budget (strength * max(0, 1 - elapsed_ratio/0.5)).')
+                        help='Guide strength schedule. fixed keeps objective_split_optimizer_guide_strength; disagreement scales it by the previous post-consensus mean disagreement; budget anneals it linearly to zero over the first 50%% of the budget (strength * max(0, 1 - elapsed_ratio/0.5)).')
     parser.add_argument('--objective_split_sigma_inherit_enable', type=int, default=0, choices=[0, 1],
                         help='Enable per-agent cross-event sigma inheritance (evolved-sigma slot, card 14). 0 keeps historical event-local sigma semantics; 1 upgrades the inherit config action to reuse the previous same-optimizer event sigma (with switch/signature reset). Default off.')
     parser.add_argument('--objective_split_sigma_validity_gate_enable', type=int, default=0, choices=[0, 1],
