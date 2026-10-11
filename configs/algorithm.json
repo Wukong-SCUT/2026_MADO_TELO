@@ -4,8 +4,11 @@
   "training_seed": 58,
   "epoch_start": 0,
   "epoch_end": 6,
+  "epoch_end_is_exclusive": true,
   "schedule_start_epoch": 0,
   "schedule_end_epoch": 23,
+  "schedule_end_is_exclusive": true,
+  "schedule_active_epoch_range": "0-22",
   "optimizer_candidates": [
     "mmes",
     "vkd",

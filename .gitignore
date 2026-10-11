@@ -1,4 +1,5 @@
 __pycache__/
 *.py[cod]
-outputs/
+/outputs/*
+!/outputs/README.md
 txt_log/
